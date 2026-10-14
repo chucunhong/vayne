@@ -1,426 +1,208 @@
 """
-VAYNE Pipeline — end-to-end orchestration.
+VAYNE pipeline (Algorithm 1) for one dataset under one audit configuration.
 
-Flow per experiment (dataset × model):
-  1. Load N balanced samples
-  2. Baseline inference  → s(x) for all samples
-  3. Sensitive-attr masked inference → s(x_{-A}) for direct-unfairness
-  4. Compute Proxy Capacity  (statistical, no LLM)
-  5. Single-feature ablations → s(x_{-j}) for each feature j
-  6. Compute Proxy Use, Proxy Risk
-  7. Select top-K proxies; compute pairwise ablations
-  8. Compute Proxy Interaction
-  9. Build Proxy Path Graph
- 10. Compute baseline fairness metrics
- 11. For each mitigation strategy (VAYNE-native + external baselines):
-       a. Apply strategy to each row
-       b. Re-run LLM inference on modified prompts
-       c. Compute post-mitigation fairness metrics
- 12. Return VAYNEResult
+  1. Split D into train/dev/test; draw the k demonstrations from train
+  2. Test split: repeated scoring of the deployment profile → baseline metrics
+  3. Dev split: 2R queries of the deployment profile → s̄ and noise floor NF
+  4. Dev split: paired swap z⁽¹⁾/z⁽⁰⁾ and UNKNOWN z⁽ᵘ⁾ → DU_A, DU_A^abl
+  5. Train split: proxy capacity PC_j and pairwise feature MI
+  6. Dev split: single-feature ablation → proxy use PU_j
+  7. PRS_j, thresholds τ₁ τ₂ τ₃, proxy path graph
+  8. F_mask from θ_PRS; F_filt selected on dev
+  9. Test split: Masking, Filtering, FPO, Fair-ICL
+ 10. Utility qualification against the traditional baselines
+
+Every score matrix is returned so that statistics can be recomputed offline.
 """
 
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
-from typing import Optional
+import time
 
-import pandas as pd
-from tqdm import tqdm
+import numpy as np
 
 from src.config import (
-    DECISION_THRESHOLD, MAX_WORKERS, TOP_K_PROXY, PRS_FILTER_THRESHOLD,
-    TAU_CAPACITY, TAU_USE, TAU_INTERACTION, GRAPH_THRESHOLD_PERCENTILE,
+    AUDIT_ENCODING, AUDIT_K, AUDIT_MODEL, AUDIT_TEMPERATURE, DATASET_CONFIGS,
+    FAIR_ICL_PER_CELL, FILTER_BA_TOLERANCE, MAX_OUTPUT_TOKENS, MITIGATE_DEMOS,
+    N_BOOTSTRAP, N_REPEATS, SEED, UTILITY_TOLERANCE,
 )
-from src.llm_client import score_row
-from src.data_loader import load_dataset, get_feature_cols, get_all_feature_cols, is_protected, get_label
-from src.serializer import serialize
-from src.proxy_capacity import compute_proxy_capacity, rank_by_capacity
-from src.proxy_use import (
-    compute_single_ablations, compute_pairwise_ablations,
-    compute_proxy_use, compute_pairwise_proxy_use,
+from src.data_loader import Split, make_splits, sample_balanced_demos, sample_demos
+from src.fairness_metrics import classification_metrics, metrics_with_sd
+from src.llm_client import MOCK
+from src.mitigation import (
+    Intervention, fair_icl, filter_candidates, filtering, fpo, masking, select_filter_set,
 )
-from src.proxy_risk import compute_proxy_risk, top_k_proxy_risk, proxy_risk_summary
-from src.proxy_interaction import compute_proxy_interaction, interaction_summary
-from src.proxy_graph import build_proxy_graph, get_proxy_paths, graph_to_dict, graph_to_ascii
-from src.fairness_metrics import compute_fairness, FairnessReport
-from src.mitigation import apply_strategy, STRATEGY_NAMES
+from src.proxy_capacity import compute_proxy_capacity, pairwise_feature_mi
+from src.proxy_graph import build_proxy_graph, get_proxy_paths, graph_to_dict
+from src.proxy_risk import mask_set, proxy_risk, proxy_risk_sd, role, thresholds
+from src.proxy_use import proxy_use, sensitivity
+from src.scoring import Scorer, fill_baseline, fill_modified, mean_score
+from src.serializer import UNKNOWN, serialize
+from src.traditional import evaluate_traditional
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class MitigationResult:
-    strategy:    str
-    scores:      list[float]
-    report:      FairnessReport
-    improvement: dict[str, float]
+def utility_status(ba: float, ba_sd: float, best_traditional_ba: float,
+                   tol: float = UTILITY_TOLERANCE) -> str:
+    """'qualified', 'caveat', or 'exploratory' (Sect. 4.1, utility criterion)."""
+    above_chance = ba - 0.5 > 1.96 * ba_sd
+    if not above_chance:
+        return "exploratory"
+    return "qualified" if ba >= best_traditional_ba - tol else "caveat"
 
 
-@dataclass
-class VAYNEResult:
-    dataset:  str
-    model:    str
-    n_samples: int
+class _Prompter:
+    """Builds the prompts of one configuration for a split."""
 
-    # ── Proxy Analysis ──────────────────────────────────────────────────────
-    proxy_capacity:   dict[str, float]     = field(default_factory=dict)
-    proxy_use:        dict[str, float]     = field(default_factory=dict)
-    proxy_risk:       dict[str, float]     = field(default_factory=dict)
-    proxy_interaction: dict               = field(default_factory=dict)
-    proxy_graph_dict: dict                = field(default_factory=dict)
-    proxy_paths:      list                = field(default_factory=list)
-    proxy_ascii:      str                 = ""
-    risk_summary:     list[dict]          = field(default_factory=list)
-    interaction_summary: list[dict]       = field(default_factory=list)
+    def __init__(self, config: dict, encoding: str, demos: list):
+        self.config, self.encoding, self.demos = config, encoding, demos
 
-    # ── Adaptive thresholds used for Proxy Path Graph ───────────────────────
-    tau_capacity:    float                     = 0.0
-    tau_use:         float                     = 0.0
-    tau_interaction: float                     = 0.0
-
-    # ── Proxy Path Graph object (NetworkX DiGraph) ──────────────────────────
-    proxy_graph_obj:  Optional[object]         = None
-
-    # ── Baseline Fairness ───────────────────────────────────────────────────
-    baseline_report:  Optional[FairnessReport] = None
-    baseline_scores:  list[float]          = field(default_factory=list)
-
-    # ── Per-strategy Results ────────────────────────────────────────────────
-    mitigation_results: list[MitigationResult] = field(default_factory=list)
-
-    # ── Raw sample metadata ─────────────────────────────────────────────────
-    labels:           list[int]           = field(default_factory=list)
-    is_protected_arr: list[bool]          = field(default_factory=list)
+    def __call__(self, split: Split, iv: Intervention | None = None,
+                 mask_cols=(), insert_protected=None) -> list[tuple[str, str]]:
+        iv = iv or Intervention("Baseline")
+        demos = iv.demos if iv.demos is not None else self.demos
+        mask = list(mask_cols) + iv.mask_cols
+        demo_mask = iv.mask_cols if MITIGATE_DEMOS else ()
+        demo_omit = iv.omit_cols if MITIGATE_DEMOS else ()
+        return [serialize(row, self.config, self.encoding, demos,
+                          mask_cols=mask, omit_cols=iv.omit_cols,
+                          insert_protected=insert_protected,
+                          system_prefix=iv.system_prefix,
+                          demo_mask_cols=demo_mask, demo_omit_cols=demo_omit)
+                for _, row in split.df.iterrows()]
 
 
-def _adaptive_thresholds(
-    proxy_capacity:   dict[str, float],
-    proxy_use:        dict[str, float],
-    proxy_interaction: dict,
-) -> tuple[float, float, float]:
-    """
-    Compute adaptive percentile thresholds for the Proxy Path Graph edges,
-    as described in paper Section 4.4.
+def run_audit(
+    dataset: str,
+    model: str = AUDIT_MODEL,
+    encoding: str = AUDIT_ENCODING,
+    k: int = AUDIT_K,
+    temperature: float = AUDIT_TEMPERATURE,
+    repeats: int = N_REPEATS,
+    n_boot: int = N_BOOTSTRAP,
+    theta_prs: float | None = None,
+    max_tokens: int = MAX_OUTPUT_TOKENS,
+) -> dict:
+    config = DATASET_CONFIGS[dataset]
+    t0 = time.time()
+    splits = make_splits(config)
+    train, dev, test = splits.train, splits.dev, splits.test
+    feats = splits.feature_cols
+    R = repeats
 
-    Falls back to config defaults when fewer than 4 values are available.
-    """
-    import numpy as np
+    demos = sample_demos(train, k)
+    prompts = _Prompter(config, encoding, demos)
+    scorer = Scorer(model, temperature, max_tokens)
 
-    pc_vals  = list(proxy_capacity.values())
-    pu_vals  = list(proxy_use.values())
-    int_vals = [v for v in proxy_interaction.values() if v > 0]
+    n_q = (len(test) * R * 5 + len(dev) * R * (2 + 3 + len(feats)))
+    logger.info("%s: ≈%d queries before filtering selection (R=%d, %d features)",
+                dataset, n_q, R, len(feats))
 
-    pct  = GRAPH_THRESHOLD_PERCENTILE
-    tau1 = float(np.percentile(pc_vals,  pct)) if len(pc_vals)  >= 4 else TAU_CAPACITY
-    tau2 = float(np.percentile(pu_vals,  pct)) if len(pu_vals)  >= 4 else TAU_USE
-    tau3 = float(np.percentile(int_vals, pct)) if len(int_vals) >= 4 else TAU_INTERACTION
+    # ── 2. Baseline on the test split ───────────────────────────────────────
+    test_mats = {"Baseline": fill_baseline(scorer.score(prompts(test), R, desc="test baseline"))}
+    s_test = mean_score(test_mats["Baseline"])
 
-    # Guard against zero thresholds (edge case when all values are identical)
-    tau1 = max(tau1, 1e-6)
-    tau2 = max(tau2, 1e-6)
-    tau3 = max(tau3, 1e-6)
+    # ── 3. Dev baseline (2R queries) and noise floor ─────────────────────────
+    dev_all = scorer.score(prompts(dev), 2 * R, desc="dev baseline")
+    base1, base2 = fill_baseline(dev_all[:, :R]), fill_baseline(dev_all[:, R:])
+    s_dev = mean_score(base1)
 
-    logger.info("Adaptive thresholds (%dth pct) — τ_PC=%.4f  τ_PU=%.4f  τ_INT=%.4f",
-                pct, tau1, tau2, tau3)
-    return tau1, tau2, tau3
+    # ── 4. Controlled sensitivity: paired swap and ablation variant ─────────
+    disp = config["protected_display"]
+    prot_key = next(v for v in disp if str(v) == str(config["protected_value"]))
+    non_key = next(v for v in disp if v != prot_key)
+    z1 = fill_modified(scorer.score(prompts(dev, insert_protected=disp[non_key]), R,
+                                    desc="swap a=1"), s_dev)
+    z0 = fill_modified(scorer.score(prompts(dev, insert_protected=disp[prot_key]), R,
+                                    desc="swap a=0"), s_dev)
+    zu = fill_modified(scorer.score(prompts(dev, insert_protected=UNKNOWN), R,
+                                    desc="A=UNKNOWN"), s_dev)
+    sens = sensitivity(base1, base2, z1, z0, zu, dev.y, dev.a, n_boot)
+    logger.info("NF=%.4f  DU_A=%.4f  DU_A_abl=%.4f", sens["NF"], sens["DU_A"], sens["DU_A_abl"])
 
+    # ── 5. Proxy capacity on the training split ──────────────────────────────
+    pc_res = compute_proxy_capacity(train.df, feats, train.a, train.y, n_boot)
+    pair_mi = pairwise_feature_mi(train.df, feats)
 
-def _run_baseline_inference(
-    df: pd.DataFrame,
-    config: dict,
-    model: str,
-    sensitive_col: str,
-    temperature: float = 0.1,
-    fs_examples_per_row: dict[int, list] | None = None,
-) -> tuple[list[float], list[float]]:
-    """
-    Run baseline and sensitive-masked inference for all rows in parallel.
+    # ── 6. Proxy use on the dev split ────────────────────────────────────────
+    ablated = {f: fill_modified(scorer.score(prompts(dev, mask_cols=[f]), R,
+                                             desc=f"ablate {f}"), s_dev)
+               for f in feats}
+    pu_res = proxy_use(base1, ablated, dev.y, dev.a, n_boot)
 
-    Returns (baseline_scores, masked_A_scores).
-    """
-    n = len(df)
-    baseline  = [None] * n
-    masked_A  = [None] * n
+    # ── 7. Proxy risk, thresholds, graph ────────────────────────────────────
+    pc, pu = pc_res["pc"], pu_res["pu"]
+    prs = proxy_risk(pc, pu)
+    prs_sd = proxy_risk_sd(pc_res["boot"], pu_res["boot"], feats)
+    tau1, tau2, tau3 = thresholds(pc, pu, pair_mi)
+    G = build_proxy_graph(config["sensitive_col"], pc, pu, pair_mi, tau1, tau2, tau3)
 
-    def _infer(i, row, mask_attr):
-        # astype(object) avoids "Invalid value 'UNKNOWN' for dtype 'int64'" on
-        # all-numeric rows (e.g. credit_card).
-        row_to_use = row.astype(object)
-        if mask_attr:
-            row_to_use[sensitive_col] = "UNKNOWN"
-        fs = fs_examples_per_row.get(i) if fs_examples_per_row else None
-        system, prompt = serialize(row_to_use, config, fs_examples=fs)
-        return score_row(prompt, model, system, temperature=temperature)
+    proxy_table = sorted(
+        ({"feature": f, "kind": pc_res["kinds"][f],
+          "PC": pc[f], "PC_sd": pc_res["pc_sd"][f],
+          "PU": pu[f], "PU_sd": pu_res["pu_sd"][f],
+          "PRS": prs[f], "PRS_sd": prs_sd[f],
+          "role": role(pc[f], pu[f], tau1, tau2)} for f in feats),
+        key=lambda r: -r["PRS"])
 
-    tasks = [(i, row, False) for i, row in df.iterrows()] + \
-            [(i, row, True)  for i, row in df.iterrows()]
+    # ── 8. Mitigation plan ───────────────────────────────────────────────────
+    theta = theta_prs if theta_prs is not None else config.get("theta_prs")
+    f_mask, theta = mask_set(prs, theta)
+    base_dev = classification_metrics(s_dev, dev.y, dev.a)
+    dev_filter = {}
+    for cand in filter_candidates(f_mask):
+        mat = fill_modified(scorer.score(prompts(dev, filtering(cand)), R,
+                                         desc=f"filter {'+'.join(cand)}"), s_dev)
+        dev_filter[cand] = classification_metrics(mean_score(mat), dev.y, dev.a)
+    f_filt, filter_log = select_filter_set(dev_filter, base_dev["BA"], FILTER_BA_TOLERANCE)
+    logger.info("F_mask=%s (θ=%.4f)  F_filt=%s", f_mask, theta, list(f_filt))
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(_infer, i, row, mask): (i, mask)
-                   for i, row, mask in tasks}
-        for fut in tqdm(as_completed(futures), total=len(tasks),
-                        desc="Baseline inference", leave=False):
-            i, is_masked = futures[fut]
-            try:
-                score = fut.result()
-                score = score if score is not None else 0.5
-                if is_masked:
-                    masked_A[i] = score
-                else:
-                    baseline[i] = score
-            except Exception as exc:
-                logger.warning("Inference failed row %d: %s", i, exc)
-                if is_masked:
-                    masked_A[i] = 0.5
-                else:
-                    baseline[i] = 0.5
+    # ── 9. Interventions on the test split ──────────────────────────────────
+    balanced = sample_balanced_demos(train, FAIR_ICL_PER_CELL)
+    for iv in (masking(f_mask), filtering(f_filt), fpo(), fair_icl(balanced)):
+        if not (iv.mask_cols or iv.omit_cols or iv.system_prefix or iv.demos is not None):
+            test_mats[iv.name] = test_mats["Baseline"]   # empty feature set
+            continue
+        test_mats[iv.name] = fill_modified(
+            scorer.score(prompts(test, iv), R, desc=f"test {iv.name}"), s_test)
 
-    return (
-        [v if v is not None else 0.5 for v in baseline],
-        [v if v is not None else 0.5 for v in masked_A],
-    )
+    mitigation = [{"Strategy": name, **metrics_with_sd(mat, test.y, test.a, n_boot)}
+                  for name, mat in test_mats.items()]
 
+    # ── 10. Utility qualification ───────────────────────────────────────────
+    traditional = evaluate_traditional(splits, n_boot)
+    best_trad = max(traditional, key=lambda r: r["BA"])
+    base = mitigation[0]
+    status = utility_status(base["BA"], base["BA_sd"], best_trad["BA"])
 
-def _run_mitigation_inference(
-    df: pd.DataFrame,
-    config: dict,
-    model: str,
-    strategy: str,
-    proxy_risk: dict[str, float],
-    top_k_features: list[str],
-    prs_threshold: float,
-    masked_A_scores: list[float],
-    temperature: float = 0.1,
-    fs_examples_per_row: dict[int, list] | None = None,
-) -> list[float]:
-    """Apply one mitigation strategy to all rows and collect scores."""
-    n = len(df)
-    scores = [None] * n
-
-    def _infer(i, row):
-        mod_row, sys_suffix, excl_cols = apply_strategy(
-            strategy, row, config, proxy_risk, top_k_features, prs_threshold
-        )
-        # "few_shot_fair" carries its own balanced few-shot examples in
-        # sys_suffix — stacking our own k-shot block on top would duplicate
-        # few-shot content and isn't faithful to the external baseline.
-        fs = None if strategy == "few_shot_fair" else (
-            fs_examples_per_row.get(i) if fs_examples_per_row else None
-        )
-        system, prompt = serialize(mod_row, config,
-                                   exclude_cols=excl_cols,
-                                   system_suffix=sys_suffix,
-                                   fs_examples=fs)
-        return score_row(prompt, model, system, temperature=temperature)
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(_infer, i, row): i for i, row in df.iterrows()}
-        for fut in tqdm(as_completed(futures), total=n,
-                        desc=f"Mitigation [{strategy}]", leave=False):
-            i = futures[fut]
-            try:
-                score = fut.result()
-                scores[i] = score if score is not None else 0.5
-            except Exception as exc:
-                logger.warning("Mitigation inference failed row %d (%s): %s",
-                               i, strategy, exc)
-                scores[i] = 0.5
-
-    return [v if v is not None else 0.5 for v in scores]
-
-
-def _build_fs_examples_per_row(
-    df: pd.DataFrame,
-    config: dict,
-    k_shot: int,
-) -> dict[int, list[tuple[pd.Series, int]]]:
-    """
-    Sample k_shot demonstration rows per evaluated row, drawn from the full
-    (unsampled) dataset so k_shot examples are actually available even when
-    n_samples is small. Excludes any pool row identical to the query row to
-    avoid showing the answer alongside the query.
-    """
-    full_df = load_dataset(config, n_samples=None)
-    full_str = full_df.astype(str)
-
-    fs_examples_per_row: dict[int, list[tuple[pd.Series, int]]] = {}
-    for i, row in df.iterrows():
-        mask = (full_str == row.astype(str)).all(axis=1)
-        pool = full_df[~mask]
-        k = min(k_shot, len(pool))
-        sample = pool.sample(n=k, random_state=i)
-        fs_examples_per_row[i] = [
-            (ex_row, get_label(ex_row, config)) for _, ex_row in sample.iterrows()
-        ]
-    return fs_examples_per_row
-
-
-def _select_few_shot_examples(
-    df: pd.DataFrame,
-    labels: list[int],
-    is_protected_arr: list[bool],
-    n_per_cell: int = 1,
-) -> list[dict]:
-    """
-    Select balanced few-shot examples: n_per_cell samples per
-    (protected/non-protected) × (positive/negative) cell.
-    Used by the "few_shot_fair" external baseline (Chhikara et al.).
-    """
-    examples = []
-    for prot_flag in [True, False]:
-        group_str = "protected" if prot_flag else "non-protected"
-        for label_val in [1, 0]:
-            idxs = [
-                i for i, (lbl, prot) in enumerate(zip(labels, is_protected_arr))
-                if lbl == label_val and prot == prot_flag
-            ]
-            if not idxs:
-                continue
-            for i in idxs[:n_per_cell]:
-                examples.append({
-                    "row":   df.iloc[i],
-                    "label": label_val,
-                    "group": group_str,
-                })
-    return examples
-
-
-def run_experiment(
-    dataset_name: str,
-    model: str,
-    config: dict,
-    n_samples: int,
-    temperature: float = 0.1,
-    k_shot: int = 0,
-) -> VAYNEResult:
-    result = VAYNEResult(dataset=dataset_name, model=model, n_samples=n_samples)
-
-    # ── Step 1: Load data ───────────────────────────────────────────────────
-    logger.info("Loading dataset '%s' (%d samples)", dataset_name, n_samples)
-    df = load_dataset(config, n_samples=n_samples)
-    result.n_samples = len(df)
-
-    sensitive_col  = config["sensitive_attrs"][0]
-    feature_cols   = get_feature_cols(df, config)      # no sensitive attr, no target
-    all_feat_cols  = get_all_feature_cols(df, config)  # includes sensitive attr
-
-    result.labels           = [get_label(row, config) for _, row in df.iterrows()]
-    result.is_protected_arr = [is_protected(row, config) for _, row in df.iterrows()]
-
-    fs_examples_per_row = None
-    if k_shot > 0:
-        logger.info("Sampling %d-shot demonstrations per row from full dataset...", k_shot)
-        fs_examples_per_row = _build_fs_examples_per_row(df, config, k_shot)
-
-    # ── Step 2 & 3: Baseline + sensitive-masked inference ───────────────────
-    logger.info("Running baseline inference...")
-    baseline_scores, masked_A_scores = _run_baseline_inference(
-        df, config, model, sensitive_col,
-        temperature=temperature, fs_examples_per_row=fs_examples_per_row,
-    )
-    result.baseline_scores = baseline_scores
-
-    # ── Step 4: Proxy Capacity (statistical, no LLM) ────────────────────────
-    logger.info("Computing proxy capacity...")
-    # Use feature_cols (excludes sensitive attr) to avoid I(A;A)=H(A) inflating PC
-    result.proxy_capacity = compute_proxy_capacity(df, feature_cols, sensitive_col)
-
-    # ── Step 5: Single-feature ablations → Proxy Use ────────────────────────
-    logger.info("Running single-feature ablations (%d features × %d samples)...",
-                len(feature_cols), len(df))
-    single_masked = compute_single_ablations(
-        df, config, model, feature_cols, baseline_scores, MAX_WORKERS,
-        temperature=temperature, fs_examples_per_row=fs_examples_per_row,
-    )
-    result.proxy_use = compute_proxy_use(baseline_scores, single_masked)
-
-    # ── Step 6: Proxy Risk ──────────────────────────────────────────────────
-    result.proxy_risk    = compute_proxy_risk(result.proxy_capacity, result.proxy_use)
-    top_k                = top_k_proxy_risk(result.proxy_risk, TOP_K_PROXY)
-    result.risk_summary  = proxy_risk_summary(result.proxy_capacity,
-                                               result.proxy_use, result.proxy_risk)
-    logger.info("Top proxy risks: %s", top_k)
-
-    # ── Step 7: Pairwise ablations → Proxy Interaction ──────────────────────
-    if len(top_k) >= 2:
-        logger.info("Running pairwise ablations for top-%d features...", len(top_k))
-        pairwise_masked = compute_pairwise_ablations(
-            df, config, model, top_k, baseline_scores, MAX_WORKERS,
-            temperature=temperature, fs_examples_per_row=fs_examples_per_row,
-        )
-        pairwise_pu        = compute_pairwise_proxy_use(baseline_scores, pairwise_masked)
-        interaction        = compute_proxy_interaction(result.proxy_use, pairwise_pu)
-        result.proxy_interaction   = {str(k): v for k, v in interaction.items()}
-        result.interaction_summary = interaction_summary(interaction)
-    else:
-        interaction = {}
-
-    # ── Step 8: Proxy Path Graph (adaptive 75th-percentile thresholds) ──────
-    logger.info("Building proxy path graph...")
-    tau1, tau2, tau3 = _adaptive_thresholds(
-        result.proxy_capacity, result.proxy_use, interaction
-    )
-    result.tau_capacity    = round(tau1, 6)
-    result.tau_use         = round(tau2, 6)
-    result.tau_interaction = round(tau3, 6)
-
-    G = build_proxy_graph(
-        sensitive_attr=sensitive_col,
-        proxy_capacity=result.proxy_capacity,
-        proxy_use=result.proxy_use,
-        proxy_interaction=interaction,
-        tau_capacity=tau1,
-        tau_use=tau2,
-        tau_interaction=tau3,
-    )
-    result.proxy_graph_dict = graph_to_dict(G)
-    result.proxy_paths      = get_proxy_paths(G, sensitive_col)
-    result.proxy_ascii      = graph_to_ascii(G, sensitive_col)
-    result.proxy_graph_obj  = G
-
-    # ── Step 9: Baseline Fairness Metrics ────────────────────────────────────
-    logger.info("Computing baseline fairness metrics...")
-    result.baseline_report = compute_fairness(
-        scores=baseline_scores,
-        scores_masked_A=masked_A_scores,
-        labels=result.labels,
-        is_protected_arr=result.is_protected_arr,
-        threshold=DECISION_THRESHOLD,
-    )
-
-    # ── Step 10: Mitigation Strategies (VAYNE + external baselines) ─────────
-    few_shot_examples = _select_few_shot_examples(
-        df, result.labels, result.is_protected_arr, n_per_cell=1
-    )
-    logger.info("Few-shot examples for 'few_shot_fair' baseline: %d total",
-                len(few_shot_examples))
-    mitigation_config = dict(config, _few_shot_examples=few_shot_examples)
-
-    for strategy in STRATEGY_NAMES:
-        logger.info("Applying mitigation strategy: %s", strategy)
-        mit_scores = _run_mitigation_inference(
-            df, mitigation_config, model, strategy,
-            result.proxy_risk, top_k, PRS_FILTER_THRESHOLD,
-            masked_A_scores,
-            temperature=temperature, fs_examples_per_row=fs_examples_per_row,
-        )
-        # Re-run sensitive-masked inference on mitigated prompts for DU measure
-        # (use masked_A_scores from baseline as approximation to save LLM calls)
-        mit_report = compute_fairness(
-            scores=mit_scores,
-            scores_masked_A=masked_A_scores,
-            labels=result.labels,
-            is_protected_arr=result.is_protected_arr,
-            threshold=DECISION_THRESHOLD,
-        )
-        improvement = mit_report.improvement_over(result.baseline_report)
-        result.mitigation_results.append(
-            MitigationResult(
-                strategy=strategy,
-                scores=mit_scores,
-                report=mit_report,
-                improvement=improvement,
-            )
-        )
-
-    return result
+    return {
+        "meta": {
+            "dataset": dataset, "model": model, "encoding": encoding, "k": k,
+            "temperature": temperature, "repeats": R, "n_boot": n_boot,
+            "max_tokens": max_tokens, "seed": SEED, "mock": MOCK,
+            "split_sizes": dict(zip(("train", "dev", "test"), splits.full_sizes)),
+            "audited": {"dev": len(dev), "test": len(test)},
+            "n_queries": scorer.n_queries, "fallback_rate": scorer.fallback_rate,
+            "runtime_s": round(time.time() - t0, 1),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        },
+        "sensitivity": sens,
+        "thresholds": {"tau1": tau1, "tau2": tau2, "tau3": tau3},
+        "proxy_table": proxy_table,
+        "pair_mi": [{"f1": a, "f2": b, "mi": v} for (a, b), v in pair_mi.items()],
+        "graph": graph_to_dict(G),
+        "proxy_paths": get_proxy_paths(G, config["sensitive_col"]),
+        "mitigation_plan": {"theta_prs": theta, "F_mask": f_mask, "F_filt": list(f_filt),
+                            "filter_search": filter_log, "dev_baseline": base_dev,
+                            "delta": FILTER_BA_TOLERANCE},
+        "mitigation": mitigation,
+        "traditional": traditional,
+        "utility": {"status": status, "best_traditional": best_trad["Model"],
+                    "best_traditional_BA": best_trad["BA"]},
+        "_arrays": {
+            "dev_y": dev.y, "dev_a": dev.a, "test_y": test.y, "test_a": test.a,
+            "dev_base1": base1, "dev_base2": base2, "dev_z1": z1, "dev_z0": z0, "dev_zu": zu,
+            **{f"dev_ablate::{f}": m for f, m in ablated.items()},
+            **{f"test::{name}": m for name, m in test_mats.items()},
+        },
+    }

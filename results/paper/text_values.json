@@ -1,0 +1,60 @@
+{
+  "german_credit": {
+    "DU_A": 0.048,
+    "NF": 0.045,
+    "DU_A_abl": 0.047,
+    "tau1": 0.02,
+    "tau2": 0.314,
+    "tau3": 0.011,
+    "theta_prs": 0.024,
+    "F_mask": [
+      "age",
+      "property",
+      "housing",
+      "credit-amount",
+      "checking-account"
+    ],
+    "F_filt": [
+      "age",
+      "property",
+      "housing"
+    ]
+  },
+  "credit_card": {
+    "DU_A": 0.012,
+    "NF": 0.011,
+    "DU_A_abl": 0.012,
+    "tau1": 0.0,
+    "tau2": 0.056,
+    "tau3": 0.004,
+    "theta_prs": 0.004,
+    "F_mask": [
+      "PAY_AMT1",
+      "PAY_AMT6"
+    ],
+    "F_filt": [
+      "PAY_AMT6"
+    ]
+  },
+  "credit_approval": {
+    "DU_A": 0.041,
+    "NF": 0.038,
+    "DU_A_abl": 0.04,
+    "tau1": 0.019,
+    "tau2": 0.368,
+    "tau3": 0.009,
+    "theta_prs": 0.02,
+    "F_mask": [
+      "Employed"
+    ],
+    "F_filt": [
+      "Employed"
+    ]
+  },
+  "_source_lines": {
+    "DU_A/NF/DU_A_abl": 987,
+    "tau1/tau2": 1026,
+    "tau3": 588,
+    "theta_prs/F_mask/F_filt": 1127
+  }
+}

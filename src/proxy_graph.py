@@ -1,15 +1,12 @@
 """
-Proxy Path Graph
+Proxy Path Graph G = (V, E) (Sect. 3.5)
 
-Constructs a directed graph explaining how unfairness propagates:
+    A ──capacity (PC_j > τ₁)──► X_j ──use (PU_j > τ₂)──► D
 
-    Protected Attribute (A)
-        |  (dashed, capacity edge if PC_j > τ₁)
-    Proxy Features
-        |  (solid, use edge if PU_j > τ₂)
-    Decision
-
-Additional proxy↔proxy dashed edges if INT_ij > τ₃.
+A formal proxy path is the two-hop pattern A → X_j → D. Feature–feature
+association links (I(X_j; X_k) > τ₃) are undirected and descriptive only:
+they show clusters and redundant encodings, not direction or mediation.
+Node colours follow the roles of src/proxy_risk.py.
 """
 
 import logging
@@ -19,6 +16,8 @@ from typing import Any, Optional
 import numpy as np
 import networkx as nx
 
+from src.proxy_risk import EPS, role
+
 logger = logging.getLogger(__name__)
 
 DECISION_NODE = "DECISION"
@@ -27,50 +26,58 @@ DECISION_NODE = "DECISION"
 # ── Graph construction ────────────────────────────────────────────────────────
 
 def build_proxy_graph(
-    sensitive_attr:   str,
-    proxy_capacity:   dict[str, float],
-    proxy_use:        dict[str, float],
-    proxy_interaction: dict[tuple[str, str], float],
-    tau_capacity:    float = 0.03,
-    tau_use:         float = 0.05,
-    tau_interaction: float = 0.02,
+    sensitive_attr: str,
+    proxy_capacity: dict[str, float],
+    proxy_use:      dict[str, float],
+    pair_mi:        dict[tuple[str, str], float],
+    tau_capacity:   float,
+    tau_use:        float,
+    tau_assoc:      float,
 ) -> nx.DiGraph:
     """
-    Build and return the proxy path graph as a NetworkX DiGraph.
-
     Node types : 'sensitive', 'proxy', 'decision'
-    Edge types : 'capacity' | 'use' | 'interaction'
+    Edge types : 'capacity' | 'use' | 'association' (stored once, u < v)
     """
     G = nx.DiGraph()
     G.add_node(sensitive_attr, node_type="sensitive")
     G.add_node(DECISION_NODE,  node_type="decision")
 
-    all_features = (set(proxy_capacity) | set(proxy_use)) - {sensitive_attr}
-    for feat in all_features:
+    for feat in proxy_use:
         pc = proxy_capacity.get(feat, 0.0)
-        pu = proxy_use.get(feat, 0.0)
-
-        if pc > tau_capacity or pu > tau_use:
-            G.add_node(feat, node_type="proxy", pc=round(pc, 4), pu=round(pu, 4))
-        if pc > tau_capacity:
+        pu = proxy_use[feat]
+        r = role(pc, pu, tau_capacity, tau_use)
+        if r == "low":
+            continue
+        G.add_node(feat, node_type="proxy", role=r, pc=round(pc, 4), pu=round(pu, 4))
+        if pc > tau_capacity + EPS:
             G.add_edge(sensitive_attr, feat, weight=round(pc, 4), edge_type="capacity")
-        if pu > tau_use:
+        if pu > tau_use + EPS:
             G.add_edge(feat, DECISION_NODE, weight=round(pu, 4), edge_type="use")
 
-    for (fi, fj), score in proxy_interaction.items():
-        if score > tau_interaction and fi in G.nodes and fj in G.nodes:
-            G.add_edge(fi, fj, weight=round(score, 4), edge_type="interaction")
-            G.add_edge(fj, fi, weight=round(score, 4), edge_type="interaction")
+    for (fi, fj), mi in pair_mi.items():
+        if mi > tau_assoc and fi in G.nodes and fj in G.nodes:
+            u, v = sorted((fi, fj))
+            G.add_edge(u, v, weight=round(mi, 4), edge_type="association")
 
     logger.info("Proxy graph: %d nodes, %d edges", G.number_of_nodes(), G.number_of_edges())
     return G
 
 
+def graph_from_dict(gd: dict) -> nx.DiGraph:
+    G = nx.DiGraph()
+    for n in gd["nodes"]:
+        G.add_node(n["id"], **{k: v for k, v in n.items() if k != "id"})
+    for e in gd["edges"]:
+        G.add_edge(e["source"], e["target"],
+                   **{k: v for k, v in e.items() if k not in ("source", "target")})
+    return G
+
+
 def get_proxy_paths(G: nx.DiGraph, sensitive_attr: str) -> list[list[str]]:
-    try:
-        return list(nx.all_simple_paths(G, sensitive_attr, DECISION_NODE))
-    except (nx.NetworkXError, nx.NodeNotFound):
-        return []
+    """Formal proxy paths A → X_j → D (association links are not traversed)."""
+    return [[sensitive_attr, v, DECISION_NODE]
+            for _, v, d in G.out_edges(sensitive_attr, data=True)
+            if d.get("edge_type") == "capacity" and G.has_edge(v, DECISION_NODE)]
 
 
 def graph_to_dict(G: nx.DiGraph) -> dict[str, Any]:
@@ -112,6 +119,7 @@ def plot_proxy_graph(
     G: nx.DiGraph,
     sensitive_attr: str,
     save_path: Optional[Path] = None,
+    max_assoc_links: int = 8,
 ) -> None:
     """
     Render the Proxy Path Graph with:
@@ -121,7 +129,9 @@ def plot_proxy_graph(
       • Colour-coded column header badges at the bottom
       • Dashed blue  : A → proxy  (capacity edge)
       • Solid dark   : proxy → Decision  (use edge)
-      • Dashed gray  : proxy ↔ proxy  (interaction edge)
+      • Dotted gray  : proxy — proxy  (association link, undirected; the
+                       max_assoc_links strongest links are drawn,
+                       width proportional to MI)
     """
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
@@ -166,28 +176,23 @@ def plot_proxy_graph(
     for n, y in zip(both,     _ys(both)):     pos[n] = np.array([cols[n], y])
     for n, y in zip(use_only, _ys(use_only)): pos[n] = np.array([cols[n], y])
 
-    # ── PRS colour mapping ───────────────────────────────────────────────────
-    prs_map = {n: G.nodes[n].get("pc", 0.0) * G.nodes[n].get("pu", 0.0)
-               for n in proxy_nodes}
-    max_prs = max(prs_map.values()) if prs_map else 1.0
+    # ── Role colour mapping (src/proxy_risk.py) ──────────────────────────────
+    _ROLE_FC = {"high_risk": "#FFDBA4", "capacity_only": "#C8EDCC",
+                "use_only": "#C5E3F5", "low": "#C5E3F5"}
+    _ROLE_EC = {"high_risk": "#E67E22", "capacity_only": "#27AE60",
+                "use_only": "#2980B9", "low": "#2980B9"}
 
     def _node_fc(n):
         nt = G.nodes[n].get("node_type", "proxy")
         if nt == "sensitive": return "#E8D5F5"
         if nt == "decision":  return "#DDE3EA"
-        r = prs_map.get(n, 0.0) / max(max_prs, 1e-9)
-        if r > 0.60: return "#FFDBA4"
-        if r > 0.25: return "#C8EDCC"
-        return "#C5E3F5"
+        return _ROLE_FC[G.nodes[n].get("role", "low")]
 
     def _node_ec(n):
         nt = G.nodes[n].get("node_type", "proxy")
         if nt == "sensitive": return "#9B59B6"
         if nt == "decision":  return "#7F8C8D"
-        r = prs_map.get(n, 0.0) / max(max_prs, 1e-9)
-        if r > 0.60: return "#E67E22"
-        if r > 0.25: return "#27AE60"
-        return "#2980B9"
+        return _ROLE_EC[G.nodes[n].get("role", "low")]
 
     def _node_lw(n):
         return 3.0 if G.nodes[n].get("node_type") == "sensitive" else 2.0
@@ -195,14 +200,9 @@ def plot_proxy_graph(
     # ── Edge classification ──────────────────────────────────────────────────
     cap_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get("edge_type") == "capacity"]
     use_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get("edge_type") == "use"]
-    int_raw   = [(u, v) for u, v, d in G.edges(data=True) if d.get("edge_type") == "interaction"]
-    seen, int_pairs = set(), []
-    for u, v in int_raw:
-        k = tuple(sorted([u, v]))
-        if k not in seen:
-            seen.add(k)
-            int_pairs.append((u, v))
-
+    assoc = sorted(((u, v, d["weight"]) for u, v, d in G.edges(data=True)
+                    if d.get("edge_type") == "association"), key=lambda e: -e[2])
+    assoc = assoc[:max_assoc_links]
     # ── Figure ───────────────────────────────────────────────────────────────
     max_col = max(len(cap_only), len(both), len(use_only), 1)
     fig_h   = max(7.0, max_col * ROW_GAP + 4.0)
@@ -220,7 +220,7 @@ def plot_proxy_graph(
         if rad is None:
             skip = (u == sensitive_attr and v in both_set) or \
                    (u in both_set and v == DECISION_NODE)
-            rad = 0.12 if skip else 0.0
+            rad = 0.22 if skip else 0.0
         ax.annotate(
             "", xy=pos[v], xytext=pos[u],
             arrowprops=dict(
@@ -240,19 +240,29 @@ def plot_proxy_graph(
     for u, v in use_edges:
         _arrow(u, v, "#1A252F", "solid",  LW_USE, alpha=0.95)
 
-    # Interaction: bidirectional with alternating curve direction to separate arrows
-    for idx, (u, v) in enumerate(int_pairs):
-        rad_val = 0.28 if idx % 2 == 0 else -0.28
-        _arrow(u, v, "#BBBBBB", "dashed", 1.4, rad= rad_val, alpha=0.7)
-        _arrow(v, u, "#BBBBBB", "dashed", 1.4, rad=-rad_val, alpha=0.7)
-        xu, yu = pos[u]; xv, yv = pos[v]
-        w = G.edges[u, v].get("weight", 0.0)
-        ax.text((xu + xv) / 2, (yu + yv) / 2 + 0.18,
-                f"INT={w:.3f}", ha="center", va="bottom",
-                fontsize=10, color="#999999", fontstyle="italic",
-                fontfamily=FONT,
-                bbox=dict(boxstyle="round,pad=0.15", fc="white",
-                          alpha=0.85, ec="none", lw=0))
+    # Association links: undirected, descriptive only. Same-column links
+    # bulge outward far enough to clear the nodes between their ends; links
+    # across columns are straight. Width grows with the pairwise MI.
+    ASSOC_C = "#8A94A0"
+    w_max = max((w for _, _, w in assoc), default=1.0)
+    for u, v, w in assoc:
+        (xu, yu), (xv, yv) = pos[u], pos[v]
+        if abs(xu - xv) < 1e-6:
+            if yu < yv:                      # draw top → bottom
+                u, v, yu, yv = v, u, yv, yu
+            dist = yu - yv
+            outward = 1 if xu >= 0 else -1  # right of centre bulges right
+            rad = -outward * min(0.9, 1.9 / dist)
+        else:
+            rad = 0.0
+        ax.annotate(
+            "", xy=pos[v], xytext=pos[u],
+            arrowprops=dict(arrowstyle="-", connectionstyle=f"arc3,rad={rad:.3f}",
+                            color=ASSOC_C, lw=1.4 + 1.8 * w / w_max, linestyle=(0, (5, 3)),
+                            shrinkA=SHRINK - 10, shrinkB=SHRINK - 10, alpha=0.9,
+                            capstyle="round"),
+            zorder=1,
+        )
 
     # ── Nodes ────────────────────────────────────────────────────────────────
     def _label(name: str, max_ch: int = 9) -> str:
@@ -319,19 +329,19 @@ def plot_proxy_graph(
         mpatches.Patch(facecolor="#E8D5F5", edgecolor="#9B59B6", lw=1.8,
                        label="Protected Attribute (A)"),
         mpatches.Patch(facecolor="#FFDBA4", edgecolor="#E67E22", lw=1.8,
-                       label="High-risk Proxy"),
+                       label="High-risk proxy (PC>τ₁, PU>τ₂)"),
         mpatches.Patch(facecolor="#C8EDCC", edgecolor="#27AE60", lw=1.8,
-                       label="Medium-risk Proxy"),
+                       label="Medium risk (PC>τ₁ only)"),
         mpatches.Patch(facecolor="#C5E3F5", edgecolor="#2980B9", lw=1.8,
-                       label="Low-risk Proxy"),
+                       label="Use-only (PU>τ₂ only)"),
         mpatches.Patch(facecolor="#DDE3EA", edgecolor="#7F8C8D", lw=1.8,
                        label="Decision"),
         Line2D([0], [0], color="#4A90D9", lw=2.0, linestyle="dashed",
                label="Capacity edge (PC)"),
         Line2D([0], [0], color="#1A252F", lw=2.5,
                label="Use edge (PU)"),
-        Line2D([0], [0], color="#AAAAAA", lw=1.4, linestyle="dashed",
-               label="Interaction (INT)"),
+        Line2D([0], [0], color="#8A94A0", lw=2.2, linestyle=(0, (5, 3)),
+               label="Association (MI>τ₃; thicker = higher MI)"),
     ]
     ax.legend(handles=legend_handles,
               loc="upper left", bbox_to_anchor=(1.01, 1.0),

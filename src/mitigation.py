@@ -1,141 +1,79 @@
 """
-VAYNE Mitigation Strategies
+Mitigation strategies (Sect. 3.6) and the prompt-level baselines (Sect. 4.1).
 
-Two VAYNE-native strategies for reducing proxy-mediated unfairness, plus two
-external baselines from prior work for comparison:
+  Masking   — values of F_mask replaced by UNKNOWN (Eq. 16)
+  Filtering — fields of F_filt ⊆ F_mask omitted from the profile; F_filt is
+              selected on the development split as the set with the lowest
+              EOD whose BA is at most δ below the unmitigated scorer (ties →
+              smallest set)
+  FPO       — one fixed fairness instruction prepended to the system message
+  Fair-ICL  — the k demonstrations balanced over sex × label
 
-  1. Proxy Masking   — set high-risk features to "UNKNOWN"
-  2. Proxy Filtering  — drop features whose PRS exceeds a threshold
-  3. Fair Prompt      — external baseline (Cherepanova et al., AIES 2025)
-  4. Fair Few-Shot    — external baseline (Chhikara et al., arXiv 2402)
-
-Each strategy returns (modified_row: pd.Series, system_suffix: str, exclude_cols: list[str])
-which can be passed directly to serializer.serialize().
+Each strategy is an Intervention that the serializer applies to every query.
 """
 
-import pandas as pd
+import itertools
+import logging
+from dataclasses import dataclass, field
 
-# VAYNE-native strategies
-VAYNE_STRATEGY_NAMES    = ["masking", "filtering"]
-# External baselines from prior work
-BASELINE_STRATEGY_NAMES = ["fair_prompt", "few_shot_fair"]
-STRATEGY_NAMES          = VAYNE_STRATEGY_NAMES + BASELINE_STRATEGY_NAMES
+import numpy as np
 
+from src.config import FILTER_BA_TOLERANCE, FPO_INSTRUCTION, MAX_FILTER_CANDIDATES
 
-# ── Strategy 1: Proxy Masking ────────────────────────────────────────────────
+logger = logging.getLogger(__name__)
 
-def apply_masking(
-    row: pd.Series,
-    high_risk_features: list[str],
-) -> tuple[pd.Series, str, list[str]]:
-    """Mask high-risk proxy features to 'UNKNOWN'."""
-    # astype(object) avoids "Invalid value 'UNKNOWN' for dtype 'int64'" on
-    # all-numeric rows (e.g. credit_card).
-    masked = row.astype(object)
-    for feat in high_risk_features:
-        if feat in masked.index:
-            masked[feat] = "UNKNOWN"
-    return masked, "", []
+STRATEGIES = ["Baseline", "Masking", "Filtering", "FPO", "Fair-ICL"]
 
 
-# ── Strategy 2: Proxy Filtering ──────────────────────────────────────────────
+@dataclass
+class Intervention:
+    name: str
+    mask_cols: list[str] = field(default_factory=list)
+    omit_cols: list[str] = field(default_factory=list)
+    system_prefix: str = ""
+    demos: list | None = None          # None → the configuration's demonstrations
 
-def apply_filtering(
-    row: pd.Series,
-    proxy_risk: dict[str, float],
-    prs_threshold: float,
-) -> tuple[pd.Series, str, list[str]]:
+
+def masking(f_mask: list[str]) -> Intervention:
+    return Intervention("Masking", mask_cols=list(f_mask))
+
+
+def filtering(f_filt: list[str]) -> Intervention:
+    return Intervention("Filtering", omit_cols=list(f_filt))
+
+
+def fpo() -> Intervention:
+    return Intervention("FPO", system_prefix=FPO_INSTRUCTION)
+
+
+def fair_icl(balanced_demos: list) -> Intervention:
+    return Intervention("Fair-ICL", demos=balanced_demos)
+
+
+def filter_candidates(f_mask: list[str]) -> list[tuple[str, ...]]:
+    """Non-empty subsets of F_mask; above MAX_FILTER_CANDIDATES features, nested top-PRS prefixes."""
+    if len(f_mask) <= MAX_FILTER_CANDIDATES:
+        return [c for r in range(1, len(f_mask) + 1)
+                for c in itertools.combinations(f_mask, r)]
+    logger.warning("|F_mask| = %d > %d; searching nested prefixes only",
+                   len(f_mask), MAX_FILTER_CANDIDATES)
+    return [tuple(f_mask[:r]) for r in range(1, len(f_mask) + 1)]
+
+
+def select_filter_set(dev_metrics: dict[tuple[str, ...], dict], base_ba: float,
+                      delta: float = FILTER_BA_TOLERANCE) -> tuple[tuple[str, ...], list[dict]]:
     """
-    Exclude columns whose proxy risk score exceeds prs_threshold.
-    The row itself is not modified; instead the excluded column list is returned
-    and passed to the serializer so those columns are omitted from the prompt.
+    dev_metrics: candidate → metrics on the development split.
+    Returns (F_filt, audit log of every candidate). An empty F_filt means no
+    candidate met the BA tolerance, so filtering equals the baseline.
     """
-    exclude = [feat for feat, prs in proxy_risk.items() if prs >= prs_threshold]
-    return row.copy(), "", exclude
-
-
-# ── Strategy 3: Fair Prompt (Cherepanova et al., AIES 2025) ─────────────────
-
-# Explicit demographic parity instruction appended to the system prompt.
-# Mirrors the "fair prompt optimization" baseline: tell the model directly
-# that positive-outcome rates must be equal across gender groups.
-FAIR_PROMPT_INSTRUCTION = (
-    "FAIRNESS REQUIREMENT: Your decisions MUST achieve demographic parity. "
-    "Assign positive outcomes to protected-group and non-protected-group "
-    "applicants at equal rates. Do NOT allow gender or any protected attribute "
-    "to influence whether an applicant receives a positive outcome."
-)
-
-
-def apply_fair_prompt(
-    row: pd.Series,
-    config: dict,
-) -> tuple[pd.Series, str, list[str]]:
-    """Append an explicit demographic-parity instruction (Cherepanova et al.)."""
-    return row.copy(), FAIR_PROMPT_INSTRUCTION, []
-
-
-# ── Strategy 4: Fair Few-Shot (Chhikara et al., arXiv 2402) ─────────────────
-
-FEW_SHOT_FAIRNESS_RULE = (
-    "FAIRNESS RULE: Individuals with similar qualifications must receive the "
-    "same outcome regardless of their protected attribute. "
-    "The following examples illustrate balanced, fair decision-making:\n\n"
-)
-
-
-def apply_few_shot_fair(
-    row: pd.Series,
-    config: dict,
-    few_shot_examples: list[dict],
-) -> tuple[pd.Series, str, list[str]]:
-    """
-    Prepend balanced few-shot examples + fairness rule (Chhikara et al.).
-    few_shot_examples: list of {'row': pd.Series, 'label': int, 'group': str}
-    """
-    if not few_shot_examples:
-        return row.copy(), FEW_SHOT_FAIRNESS_RULE, []
-
-    from src.serializer import serialize
-    lines = [FEW_SHOT_FAIRNESS_RULE]
-    for idx, ex in enumerate(few_shot_examples, 1):
-        _, ex_prompt = serialize(ex["row"], config)
-        label_str = "YES (positive outcome)" if ex["label"] == 1 else "NO (negative outcome)"
-        lines.append(f"**Example {idx}** → Decision: {label_str}\n{ex_prompt}\n---\n")
-    lines.append("Now make your prediction for the following applicant:\n")
-
-    system_suffix = "\n".join(lines)
-    return row.copy(), system_suffix, []
-
-
-# ── Unified dispatcher ───────────────────────────────────────────────────────
-
-def apply_strategy(
-    strategy: str,
-    row: pd.Series,
-    config: dict,
-    proxy_risk: dict[str, float],
-    top_k_features: list[str],
-    prs_threshold: float = 0.05,
-) -> tuple[pd.Series, str, list[str]]:
-    """
-    Dispatch to the requested strategy.
-
-    Returns (modified_row, system_suffix, exclude_cols).
-    """
-    if strategy == "masking":
-        return apply_masking(row, top_k_features)
-
-    elif strategy == "filtering":
-        return apply_filtering(row, proxy_risk, prs_threshold)
-
-    elif strategy == "fair_prompt":
-        return apply_fair_prompt(row, config)
-
-    elif strategy == "few_shot_fair":
-        # few_shot_examples must be injected via config at call time
-        examples = config.get("_few_shot_examples", [])
-        return apply_few_shot_fair(row, config, examples)
-
-    else:
-        raise ValueError(f"Unknown mitigation strategy: '{strategy}'")
+    log = []
+    for cand, m in dev_metrics.items():
+        ok = m["BA"] >= base_ba - delta
+        log.append({"features": list(cand), "BA": m["BA"], "EOD": m["EOD"], "feasible": ok})
+    feasible = [(m["EOD"], len(c), c) for c, m in dev_metrics.items()
+                if m["BA"] >= base_ba - delta and not np.isnan(m["EOD"])]
+    if not feasible:
+        logger.warning("No filtering candidate within BA tolerance δ=%.3f", delta)
+        return (), log
+    return min(feasible)[2], log

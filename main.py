@@ -1,88 +1,65 @@
 """
-VAYNE — Main experiment runner
+VAYNE — full audit (RQ2 diagnosis + RQ3 mitigation) under the audit
+configuration of the paper: Claude-3-Haiku, Template encoding, k = 128,
+temperature 0.4, R repeated queries per prompt.
 
-Usage examples:
-  python main.py
-  python main.py --datasets german_credit --models deepseek/deepseek-chat --n 30
-  python main.py --datasets adult --n 50 --verbose
+Usage:
+  python main.py                                  # all three datasets
+  python main.py --datasets german_credit --repeats 5
+  VAYNE_MOCK=1 python main.py --results-dir /tmp/vayne_smoke --n-boot 50   # offline smoke test
+
+Figures and LaTeX tables are produced afterwards from the saved files:
+  python -m scripts.make_figures && python -m scripts.make_tables
 """
-
-import matplotlib
-matplotlib.use("Agg")  # non-interactive backend — prevents tkinter crash in ThreadPoolExecutor
 
 import argparse
 import logging
 import sys
 from pathlib import Path
 
-from src.config import DATASET_CONFIGS, DEFAULT_MODEL, MODELS, RESULTS_DIR
-from src.pipeline import run_experiment
-from src.reporting import save_results
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
-    datefmt="%H:%M:%S",
-    stream=sys.stdout,
+from src.config import (
+    AUDIT_ENCODING, AUDIT_K, AUDIT_MODEL, AUDIT_TEMPERATURE, DATASET_CONFIGS,
+    DATASET_ORDER, MAX_OUTPUT_TOKENS, N_BOOTSTRAP, N_REPEATS, RESULTS_DIR,
 )
+from src.llm_client import MOCK
+from src.pipeline import run_audit
+from src.reporting import print_results, save_results
+
+logging.basicConfig(level=logging.INFO, stream=sys.stdout, datefmt="%H:%M:%S",
+                    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s")
 logger = logging.getLogger("vayne.main")
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="VAYNE: Proxy Fairness in LLM-based Decisions")
-    p.add_argument("--datasets", nargs="+",
-                   default=list(DATASET_CONFIGS.keys()),
-                   choices=list(DATASET_CONFIGS.keys()),
-                   help="Datasets to run (default: all)")
-    p.add_argument("--models", nargs="+",
-                   default=[DEFAULT_MODEL],
-                   help="Model identifiers via OpenRouter (default: deepseek/deepseek-chat)")
-    p.add_argument("--n", type=int, default=30,
-                   help="Number of samples per dataset (default: 30)")
-    p.add_argument("--temperature", type=float, default=0.1,
-                   help="LLM sampling temperature for all inference calls (default: 0.1)")
-    p.add_argument("--k-shot", type=int, default=0,
-                   help="Few-shot demonstrations per query, sampled from the full "
-                        "dataset (default: 0 = zero-shot)")
-    p.add_argument("--results-dir", type=str, default=str(RESULTS_DIR),
-                   help="Output directory for JSON/CSV/PNG results (default: ./results)")
-    p.add_argument("--verbose", action="store_true", default=True,
-                   help="Print results to console (default: True)")
+    p = argparse.ArgumentParser(description="VAYNE: proxy fairness audit of an LLM credit scorer")
+    p.add_argument("--datasets", nargs="+", default=DATASET_ORDER, choices=list(DATASET_CONFIGS))
+    p.add_argument("--model", default=AUDIT_MODEL)
+    p.add_argument("--encoding", default=AUDIT_ENCODING, choices=["template", "markdown"])
+    p.add_argument("--k", type=int, default=AUDIT_K)
+    p.add_argument("--temperature", type=float, default=AUDIT_TEMPERATURE)
+    p.add_argument("--repeats", type=int, default=N_REPEATS)
+    p.add_argument("--n-boot", type=int, default=N_BOOTSTRAP)
+    p.add_argument("--max-tokens", type=int, default=MAX_OUTPUT_TOKENS)
+    p.add_argument("--theta-prs", type=float, default=None,
+                   help="θ_PRS for every dataset (default: per-dataset config, else 75th pct of PRS)")
+    p.add_argument("--results-dir", default=str(RESULTS_DIR))
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     results_dir = Path(args.results_dir)
+    if MOCK and results_dir.resolve() == RESULTS_DIR.resolve():
+        sys.exit("VAYNE_MOCK=1 must not write to the real results directory; pass --results-dir")
 
-    logger.info("VAYNE experiment started")
-    logger.info("Datasets    : %s", args.datasets)
-    logger.info("Models      : %s", args.models)
-    logger.info("Samples     : %d", args.n)
-    logger.info("Temperature : %s", args.temperature)
-    logger.info("K-shot      : %d", args.k_shot)
-    logger.info("Results dir : %s", results_dir)
-
-    for dataset_name in args.datasets:
-        config = DATASET_CONFIGS[dataset_name]
-        for model in args.models:
-            logger.info("─" * 55)
-            logger.info("Running: dataset=%s  model=%s", dataset_name, model)
-            try:
-                result = run_experiment(
-                    dataset_name=dataset_name,
-                    model=model,
-                    config=config,
-                    n_samples=args.n,
-                    temperature=args.temperature,
-                    k_shot=args.k_shot,
-                )
-                save_results(result, verbose=args.verbose, results_dir=results_dir)
-            except Exception as exc:
-                logger.error("Experiment failed (%s / %s): %s", dataset_name, model, exc,
-                             exc_info=True)
-
-    logger.info("All experiments complete. Results saved to %s", results_dir)
+    for ds in args.datasets:
+        logger.info("─" * 60)
+        logger.info("Audit: %s  (%s, %s, k=%d, T=%.2f, R=%d)", ds, args.model, args.encoding,
+                    args.k, args.temperature, args.repeats)
+        result = run_audit(ds, args.model, args.encoding, args.k, args.temperature,
+                           args.repeats, args.n_boot, args.theta_prs, args.max_tokens)
+        save_results(result, results_dir)
+        print_results(result)
 
 
 if __name__ == "__main__":

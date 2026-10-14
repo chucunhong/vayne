@@ -1,165 +1,69 @@
 """
-Proxy Use: PU_j = E_x [ |s(x) - s(x_{-j})| ]
+Score-difference statistics computed on the development split:
 
-Measures how much the LLM's decision changes when feature X_j is masked.
-High PU_j → the LLM heavily relies on this feature.
+  NF        = E_z |s̄⁽¹⁾(z) − s̄⁽²⁾(z)|                  noise floor (Eq. 11)
+  DU_A      = E_z |s̄(z⁽¹⁾) − s̄(z⁽⁰⁾)|                  paired swap (Eq. 9)
+  DU_A^abl  = E_(a,z) |s̄(z⁽ᵃ⁾) − s̄(z⁽ᵘ⁾)|               ablation variant (Eq. 10)
+  PU_j      = E_z |s̄(z) − s̄(z₋ⱼ)|                     proxy use (Eq. 14)
 
-Also computes pairwise PU_ij = E_x [ |s(x) - s(x_{-i,-j})| ]
-needed for interaction analysis.
+All inputs are (n, R) score matrices over the same applicants; SDs come from
+the stratified applicant-and-repeat bootstrap.
 """
 
-import logging
 import numpy as np
-import pandas as pd
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
-from typing import Optional
 
-from src.llm_client import score_row, extract_p_yes
-from src.serializer import serialize
-
-logger = logging.getLogger(__name__)
+from src.config import N_BOOTSTRAP, SEED
+from src.fairness_metrics import resampled_mean, stratified_rows
 
 
-def _score_masked(
-    row: pd.Series,
-    config: dict,
-    model: str,
-    mask_cols: list[str],
-    temperature: float = 0.1,
-    fs_examples: list[tuple[pd.Series, int]] | None = None,
-) -> Optional[float]:
-    """Score a row with mask_cols set to 'UNKNOWN'."""
-    # astype(object) avoids "Invalid value 'UNKNOWN' for dtype 'int64'" when the
-    # row's columns are all-numeric (e.g. credit_card) and would otherwise stay
-    # a homogeneously-typed Series that rejects string assignment.
-    masked_row = row.astype(object)
-    for col in mask_cols:
-        if col in masked_row.index:
-            masked_row[col] = "UNKNOWN"
-
-    system, prompt = serialize(masked_row, config, fs_examples=fs_examples)
-    return score_row(prompt, model, system, temperature=temperature)
+def _mad(u: np.ndarray, v: np.ndarray) -> float:
+    return float(np.mean(np.abs(u - v)))
 
 
-def compute_single_ablations(
-    df: pd.DataFrame,
-    config: dict,
-    model: str,
-    feature_cols: list[str],
-    baseline_scores: list[float],
-    max_workers: int = 8,
-    temperature: float = 0.1,
-    fs_examples_per_row: dict[int, list[tuple[pd.Series, int]]] | None = None,
-) -> dict[str, list[float]]:
+def sensitivity(base_1: np.ndarray, base_2: np.ndarray, z1: np.ndarray, z0: np.ndarray,
+                zu: np.ndarray, y: np.ndarray, a: np.ndarray,
+                n_boot: int = N_BOOTSTRAP, seed: int = SEED) -> dict[str, float]:
     """
-    For each feature j, compute s(x_{-j}) for all rows.
-
-    Returns dict: feature → list of masked scores (one per row).
+    base_1, base_2 : two independent sets of R queries of the deployment profile
+    z1, z0         : audit profiles with A inserted as the non-protected / protected value
+    zu             : audit profile with A inserted as UNKNOWN
     """
-    n = len(df)
-    masked_scores: dict[str, list[Optional[float]]] = {f: [None] * n for f in feature_cols}
+    def _stats(m1, m2, s1, s0, su, aa):
+        own = np.where(aa == 1, s1, s0)
+        return {"NF": _mad(m1, m2), "DU_A": _mad(s1, s0), "DU_A_abl": _mad(own, su)}
 
-    tasks = [(i, row, feat) for feat in feature_cols for i, row in df.iterrows()]
+    mean = lambda m: np.nanmean(m, axis=1)
+    point = _stats(mean(base_1), mean(base_2), mean(z1), mean(z0), mean(zu), a)
 
-    def _run(args):
-        i, row, feat = args
-        fs = fs_examples_per_row.get(i) if fs_examples_per_row else None
-        return feat, i, _score_masked(row, config, model, [feat],
-                                       temperature=temperature, fs_examples=fs)
-
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(_run, t): t for t in tasks}
-        for fut in tqdm(as_completed(futures), total=len(tasks),
-                        desc="Single ablations", leave=False):
-            try:
-                feat, i, score = fut.result()
-                if score is not None:
-                    masked_scores[feat][i] = score
-                else:
-                    masked_scores[feat][i] = baseline_scores[i]
-            except Exception as exc:
-                logger.warning("Ablation failed: %s", exc)
-
-    # Fill any remaining None with baseline score
-    for feat in feature_cols:
-        for idx in range(n):
-            if masked_scores[feat][idx] is None:
-                masked_scores[feat][idx] = baseline_scores[idx]
-
-    return {f: [v for v in masked_scores[f]] for f in feature_cols}
+    rng = np.random.default_rng(seed)
+    reps = []
+    for _ in range(n_boot):
+        rows = stratified_rows(rng, y, a)
+        reps.append(_stats(*(resampled_mean(rng, m, rows)
+                             for m in (base_1, base_2, z1, z0, zu)), a[rows]))
+    out = dict(point)
+    for k in point:
+        out[f"{k}_sd"] = float(np.std([r[k] for r in reps], ddof=1)) if n_boot > 1 else np.nan
+    return out
 
 
-def compute_pairwise_ablations(
-    df: pd.DataFrame,
-    config: dict,
-    model: str,
-    top_features: list[str],
-    baseline_scores: list[float],
-    max_workers: int = 8,
-    temperature: float = 0.1,
-    fs_examples_per_row: dict[int, list[tuple[pd.Series, int]]] | None = None,
-) -> dict[tuple[str, str], list[float]]:
+def proxy_use(base: np.ndarray, ablated: dict[str, np.ndarray], y: np.ndarray,
+              a: np.ndarray, n_boot: int = N_BOOTSTRAP, seed: int = SEED) -> dict:
     """
-    For each pair (i, j) in top_features, compute s(x_{-i,-j}) for all rows.
-
-    Returns dict: (feat_i, feat_j) → list of masked scores.
+    PU_j for every ablated feature.
+    Returns {"pu": {feat: v}, "pu_sd": {feat: sd}, "boot": (n_boot, d) array}.
     """
-    pairs = [(top_features[i], top_features[j])
-             for i in range(len(top_features))
-             for j in range(i + 1, len(top_features))]
+    feats = list(ablated)
+    s = np.nanmean(base, axis=1)
+    pu = {f: _mad(s, np.nanmean(ablated[f], axis=1)) for f in feats}
 
-    n = len(df)
-    pairwise_scores: dict[tuple, list[Optional[float]]] = {p: [None] * n for p in pairs}
-
-    tasks = [(row_idx, row, pair) for pair in pairs for row_idx, row in df.iterrows()]
-
-    def _run(args):
-        row_idx, row, pair = args
-        fs = fs_examples_per_row.get(row_idx) if fs_examples_per_row else None
-        return pair, row_idx, _score_masked(row, config, model, list(pair),
-                                             temperature=temperature, fs_examples=fs)
-
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(_run, t): t for t in tasks}
-        for fut in tqdm(as_completed(futures), total=len(tasks),
-                        desc="Pairwise ablations", leave=False):
-            try:
-                pair, row_idx, score = fut.result()
-                if score is not None:
-                    pairwise_scores[pair][row_idx] = score
-                else:
-                    pairwise_scores[pair][row_idx] = baseline_scores[row_idx]
-            except Exception as exc:
-                logger.warning("Pairwise ablation failed: %s", exc)
-
-    for pair in pairs:
-        for idx in range(n):
-            if pairwise_scores[pair][idx] is None:
-                pairwise_scores[pair][idx] = baseline_scores[idx]
-
-    return {p: [v for v in pairwise_scores[p]] for p in pairs}
-
-
-def compute_proxy_use(
-    baseline_scores: list[float],
-    single_masked_scores: dict[str, list[float]],
-) -> dict[str, float]:
-    """PU_j = E_x[ |s(x) - s(x_{-j})| ]"""
-    result = {}
-    for feat, masked in single_masked_scores.items():
-        diffs = [abs(b - m) for b, m in zip(baseline_scores, masked)]
-        result[feat] = float(np.mean(diffs))
-    return result
-
-
-def compute_pairwise_proxy_use(
-    baseline_scores: list[float],
-    pairwise_masked_scores: dict[tuple[str, str], list[float]],
-) -> dict[tuple[str, str], float]:
-    """PU_ij = E_x[ |s(x) - s(x_{-i,-j})| ]"""
-    result = {}
-    for pair, masked in pairwise_masked_scores.items():
-        diffs = [abs(b - m) for b, m in zip(baseline_scores, masked)]
-        result[pair] = float(np.mean(diffs))
-    return result
+    rng = np.random.default_rng(seed)
+    boot = np.zeros((n_boot, len(feats)))
+    for b in range(n_boot):
+        rows = stratified_rows(rng, y, a)
+        sb = resampled_mean(rng, base, rows)
+        for j, f in enumerate(feats):
+            boot[b, j] = _mad(sb, resampled_mean(rng, ablated[f], rows))
+    sd = {f: float(boot[:, j].std(ddof=1)) if n_boot > 1 else np.nan
+          for j, f in enumerate(feats)}
+    return {"pu": pu, "pu_sd": sd, "boot": boot}
