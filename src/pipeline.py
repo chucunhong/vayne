@@ -3,14 +3,14 @@ VAYNE pipeline (Algorithm 1) for one dataset under one audit configuration.
 
   1. Split D into train/dev/test; draw the k demonstrations from train
   2. Test split: repeated scoring of the deployment profile → baseline metrics
-  3. Dev split: 2R queries of the deployment profile → s̄ and noise floor NF
-  4. Dev split: paired swap z⁽¹⁾/z⁽⁰⁾ and UNKNOWN z⁽ᵘ⁾ → DU_A, DU_A^abl
+  3. Dev split: repeated scoring of the deployment profile → s̄(z)
+  4. Dev split: A inserted with the stated value and with UNKNOWN → DU_A
   5. Train split: proxy capacity PC_j and pairwise feature MI
   6. Dev split: single-feature ablation → proxy use PU_j
   7. PRS_j, thresholds τ₁ τ₂ τ₃, proxy path graph
   8. F_mask from θ_PRS; F_filt selected on dev
   9. Test split: Masking, Filtering, FPO, Fair-ICL
- 10. Utility qualification against the traditional baselines
+ 10. Traditional baselines on the same test records
 
 Every score matrix is returned so that statistics can be recomputed offline.
 """
@@ -23,32 +23,23 @@ import numpy as np
 from src.config import (
     AUDIT_ENCODING, AUDIT_K, AUDIT_MODEL, AUDIT_TEMPERATURE, DATASET_CONFIGS,
     FAIR_ICL_PER_CELL, FILTER_BA_TOLERANCE, MAX_OUTPUT_TOKENS, MITIGATE_DEMOS,
-    N_BOOTSTRAP, N_REPEATS, SEED, UTILITY_TOLERANCE,
+    N_REPEATS, SEED,
 )
 from src.data_loader import Split, make_splits, sample_balanced_demos, sample_demos
-from src.fairness_metrics import classification_metrics, metrics_with_sd
+from src.fairness_metrics import classification_metrics, metrics_over_runs
 from src.llm_client import MOCK
 from src.mitigation import (
     Intervention, fair_icl, filter_candidates, filtering, fpo, masking, select_filter_set,
 )
 from src.proxy_capacity import compute_proxy_capacity, pairwise_feature_mi
 from src.proxy_graph import build_proxy_graph, get_proxy_paths, graph_to_dict
-from src.proxy_risk import mask_set, proxy_risk, proxy_risk_sd, role, thresholds
-from src.proxy_use import proxy_use, sensitivity
+from src.proxy_risk import mask_set, proxy_risk, role, thresholds
+from src.proxy_use import direct_sensitivity, proxy_use
 from src.scoring import Scorer, fill_baseline, fill_modified, mean_score
 from src.serializer import UNKNOWN, serialize
 from src.traditional import evaluate_traditional
 
 logger = logging.getLogger(__name__)
-
-
-def utility_status(ba: float, ba_sd: float, best_traditional_ba: float,
-                   tol: float = UTILITY_TOLERANCE) -> str:
-    """'qualified', 'caveat', or 'exploratory' (Sect. 4.1, utility criterion)."""
-    above_chance = ba - 0.5 > 1.96 * ba_sd
-    if not above_chance:
-        return "exploratory"
-    return "qualified" if ba >= best_traditional_ba - tol else "caveat"
 
 
 class _Prompter:
@@ -59,17 +50,20 @@ class _Prompter:
 
     def __call__(self, split: Split, iv: Intervention | None = None,
                  mask_cols=(), insert_protected=None) -> list[tuple[str, str]]:
+        """insert_protected: None, one value for every record, or one value per record."""
         iv = iv or Intervention("Baseline")
+        if insert_protected is None or isinstance(insert_protected, str):
+            insert_protected = [insert_protected] * len(split)
         demos = iv.demos if iv.demos is not None else self.demos
         mask = list(mask_cols) + iv.mask_cols
         demo_mask = iv.mask_cols if MITIGATE_DEMOS else ()
         demo_omit = iv.omit_cols if MITIGATE_DEMOS else ()
         return [serialize(row, self.config, self.encoding, demos,
                           mask_cols=mask, omit_cols=iv.omit_cols,
-                          insert_protected=insert_protected,
+                          insert_protected=ins,
                           system_prefix=iv.system_prefix,
                           demo_mask_cols=demo_mask, demo_omit_cols=demo_omit)
-                for _, row in split.df.iterrows()]
+                for (_, row), ins in zip(split.df.iterrows(), insert_protected)]
 
 
 def run_audit(
@@ -79,7 +73,6 @@ def run_audit(
     k: int = AUDIT_K,
     temperature: float = AUDIT_TEMPERATURE,
     repeats: int = N_REPEATS,
-    n_boot: int = N_BOOTSTRAP,
     theta_prs: float | None = None,
     max_tokens: int = MAX_OUTPUT_TOKENS,
 ) -> dict:
@@ -94,7 +87,7 @@ def run_audit(
     prompts = _Prompter(config, encoding, demos)
     scorer = Scorer(model, temperature, max_tokens)
 
-    n_q = (len(test) * R * 5 + len(dev) * R * (2 + 3 + len(feats)))
+    n_q = len(test) * R * 5 + len(dev) * R * (3 + len(feats))
     logger.info("%s: ≈%d queries before filtering selection (R=%d, %d features)",
                 dataset, n_q, R, len(feats))
 
@@ -102,59 +95,51 @@ def run_audit(
     test_mats = {"Baseline": fill_baseline(scorer.score(prompts(test), R, desc="test baseline"))}
     s_test = mean_score(test_mats["Baseline"])
 
-    # ── 3. Dev baseline (2R queries) and noise floor ─────────────────────────
-    dev_all = scorer.score(prompts(dev), 2 * R, desc="dev baseline")
-    base1, base2 = fill_baseline(dev_all[:, :R]), fill_baseline(dev_all[:, R:])
-    s_dev = mean_score(base1)
+    # ── 3. Baseline on the dev split ─────────────────────────────────────────
+    base_dev = fill_baseline(scorer.score(prompts(dev), R, desc="dev baseline"))
+    s_dev = mean_score(base_dev)
 
-    # ── 4. Controlled sensitivity: paired swap and ablation variant ─────────
-    disp = config["protected_display"]
-    prot_key = next(v for v in disp if str(v) == str(config["protected_value"]))
-    non_key = next(v for v in disp if v != prot_key)
-    z1 = fill_modified(scorer.score(prompts(dev, insert_protected=disp[non_key]), R,
-                                    desc="swap a=1"), s_dev)
-    z0 = fill_modified(scorer.score(prompts(dev, insert_protected=disp[prot_key]), R,
-                                    desc="swap a=0"), s_dev)
-    zu = fill_modified(scorer.score(prompts(dev, insert_protected=UNKNOWN), R,
-                                    desc="A=UNKNOWN"), s_dev)
-    sens = sensitivity(base1, base2, z1, z0, zu, dev.y, dev.a, n_boot)
-    logger.info("NF=%.4f  DU_A=%.4f  DU_A_abl=%.4f", sens["NF"], sens["DU_A"], sens["DU_A_abl"])
+    # ── 4. Direct sensitivity: stated A vs. A = UNKNOWN ─────────────────────
+    disp = {str(k): v for k, v in config["protected_display"].items()}
+    stated_vals = dev.df[config["sensitive_col"]].astype(str).map(disp).tolist()
+    stated = fill_modified(scorer.score(prompts(dev, insert_protected=stated_vals), R,
+                                        desc="A stated"), s_dev)
+    unknown = fill_modified(scorer.score(prompts(dev, insert_protected=UNKNOWN), R,
+                                         desc="A=UNKNOWN"), s_dev)
+    du_a = direct_sensitivity(stated, unknown)
+    logger.info("DU_A=%.4f", du_a)
 
     # ── 5. Proxy capacity on the training split ──────────────────────────────
-    pc_res = compute_proxy_capacity(train.df, feats, train.a, train.y, n_boot)
+    pc_res = compute_proxy_capacity(train.df, feats, train.a)
     pair_mi = pairwise_feature_mi(train.df, feats)
 
     # ── 6. Proxy use on the dev split ────────────────────────────────────────
     ablated = {f: fill_modified(scorer.score(prompts(dev, mask_cols=[f]), R,
                                              desc=f"ablate {f}"), s_dev)
                for f in feats}
-    pu_res = proxy_use(base1, ablated, dev.y, dev.a, n_boot)
+    pu = proxy_use(base_dev, ablated)
 
     # ── 7. Proxy risk, thresholds, graph ────────────────────────────────────
-    pc, pu = pc_res["pc"], pu_res["pu"]
+    pc = pc_res["pc"]
     prs = proxy_risk(pc, pu)
-    prs_sd = proxy_risk_sd(pc_res["boot"], pu_res["boot"], feats)
     tau1, tau2, tau3 = thresholds(pc, pu, pair_mi)
     G = build_proxy_graph(config["sensitive_col"], pc, pu, pair_mi, tau1, tau2, tau3)
 
     proxy_table = sorted(
-        ({"feature": f, "kind": pc_res["kinds"][f],
-          "PC": pc[f], "PC_sd": pc_res["pc_sd"][f],
-          "PU": pu[f], "PU_sd": pu_res["pu_sd"][f],
-          "PRS": prs[f], "PRS_sd": prs_sd[f],
-          "role": role(pc[f], pu[f], tau1, tau2)} for f in feats),
+        ({"feature": f, "kind": pc_res["kinds"][f], "PC": pc[f], "PU": pu[f],
+          "PRS": prs[f], "role": role(pc[f], pu[f], tau1, tau2)} for f in feats),
         key=lambda r: -r["PRS"])
 
     # ── 8. Mitigation plan ───────────────────────────────────────────────────
     theta = theta_prs if theta_prs is not None else config.get("theta_prs")
     f_mask, theta = mask_set(prs, theta)
-    base_dev = classification_metrics(s_dev, dev.y, dev.a)
+    base_dev_m = classification_metrics(s_dev, dev.y, dev.a)
     dev_filter = {}
     for cand in filter_candidates(f_mask):
         mat = fill_modified(scorer.score(prompts(dev, filtering(cand)), R,
                                          desc=f"filter {'+'.join(cand)}"), s_dev)
         dev_filter[cand] = classification_metrics(mean_score(mat), dev.y, dev.a)
-    f_filt, filter_log = select_filter_set(dev_filter, base_dev["BA"], FILTER_BA_TOLERANCE)
+    f_filt, filter_log = select_filter_set(dev_filter, base_dev_m["BA"], FILTER_BA_TOLERANCE)
     logger.info("F_mask=%s (θ=%.4f)  F_filt=%s", f_mask, theta, list(f_filt))
 
     # ── 9. Interventions on the test split ──────────────────────────────────
@@ -166,19 +151,16 @@ def run_audit(
         test_mats[iv.name] = fill_modified(
             scorer.score(prompts(test, iv), R, desc=f"test {iv.name}"), s_test)
 
-    mitigation = [{"Strategy": name, **metrics_with_sd(mat, test.y, test.a, n_boot)}
+    mitigation = [{"Strategy": name, **metrics_over_runs(mat, test.y, test.a)}
                   for name, mat in test_mats.items()]
 
-    # ── 10. Utility qualification ───────────────────────────────────────────
-    traditional = evaluate_traditional(splits, n_boot)
-    best_trad = max(traditional, key=lambda r: r["BA"])
-    base = mitigation[0]
-    status = utility_status(base["BA"], base["BA_sd"], best_trad["BA"])
+    # ── 10. Traditional baselines ───────────────────────────────────────────
+    traditional = evaluate_traditional(splits, R)
 
     return {
         "meta": {
             "dataset": dataset, "model": model, "encoding": encoding, "k": k,
-            "temperature": temperature, "repeats": R, "n_boot": n_boot,
+            "temperature": temperature, "repeats": R,
             "max_tokens": max_tokens, "seed": SEED, "mock": MOCK,
             "split_sizes": dict(zip(("train", "dev", "test"), splits.full_sizes)),
             "audited": {"dev": len(dev), "test": len(test)},
@@ -186,22 +168,20 @@ def run_audit(
             "runtime_s": round(time.time() - t0, 1),
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         },
-        "sensitivity": sens,
+        "sensitivity": {"DU_A": du_a, "tau2": tau2, "ratio": du_a / tau2 if tau2 else np.nan},
         "thresholds": {"tau1": tau1, "tau2": tau2, "tau3": tau3},
         "proxy_table": proxy_table,
         "pair_mi": [{"f1": a, "f2": b, "mi": v} for (a, b), v in pair_mi.items()],
         "graph": graph_to_dict(G),
         "proxy_paths": get_proxy_paths(G, config["sensitive_col"]),
         "mitigation_plan": {"theta_prs": theta, "F_mask": f_mask, "F_filt": list(f_filt),
-                            "filter_search": filter_log, "dev_baseline": base_dev,
+                            "filter_search": filter_log, "dev_baseline": base_dev_m,
                             "delta": FILTER_BA_TOLERANCE},
         "mitigation": mitigation,
         "traditional": traditional,
-        "utility": {"status": status, "best_traditional": best_trad["Model"],
-                    "best_traditional_BA": best_trad["BA"]},
         "_arrays": {
             "dev_y": dev.y, "dev_a": dev.a, "test_y": test.y, "test_a": test.a,
-            "dev_base1": base1, "dev_base2": base2, "dev_z1": z1, "dev_z0": z0, "dev_zu": zu,
+            "dev_base": base_dev, "dev_A_stated": stated, "dev_A_unknown": unknown,
             **{f"dev_ablate::{f}": m for f, m in ablated.items()},
             **{f"test::{name}": m for name, m in test_mats.items()},
         },

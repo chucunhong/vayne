@@ -24,8 +24,7 @@ from joblib import Parallel, delayed
 from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
 from sklearn.metrics import mutual_info_score
 
-from src.config import KNN_NEIGHBORS, MAX_CATEGORICAL_LEVELS, N_BOOTSTRAP, SEED
-from src.fairness_metrics import stratified_rows
+from src.config import KNN_NEIGHBORS, MAX_CATEGORICAL_LEVELS, SEED
 
 logger = logging.getLogger(__name__)
 
@@ -80,41 +79,12 @@ def _pc_all(arrays: dict, kinds: dict, a: np.ndarray, seed: int) -> dict[str, fl
 
 
 def compute_proxy_capacity(df: pd.DataFrame, cols: list[str], a: np.ndarray,
-                           y: np.ndarray | None = None, n_boot: int = N_BOOTSTRAP,
-                           seed: int = SEED, n_jobs: int = -1) -> dict:
-    """
-    PC_j for every feature with bootstrap SDs over resampled training records.
-
-    Returns {"pc": {feat: value}, "pc_sd": {feat: sd}, "kinds": {feat: kind},
-             "boot": (n_boot, d) array aligned with `cols`}.
-
-    Note: resampling with replacement duplicates records, which the
-    nearest-neighbour estimator sees as zero-distance neighbours; bootstrap
-    replicates of continuous features are therefore biased upward and the SD
-    should be read as approximate.
-    """
+                           seed: int = SEED) -> dict:
+    """PC_j for every feature. Returns {"pc": {feat: value}, "kinds": {feat: kind}}."""
     kinds, arrays = _encode(df, cols)
-    point = _pc_all(arrays, kinds, a, seed)
-
-    boot = np.zeros((0, len(cols)))
-    sd = {c: np.nan for c in cols}
-    if n_boot > 0:
-        strat_y = y if y is not None else np.zeros_like(a)
-        rng = np.random.default_rng(seed)
-        row_sets = [stratified_rows(rng, strat_y, a) for _ in range(n_boot)]
-
-        def _one(rows, b):
-            sub = {c: x[rows] for c, x in arrays.items()}
-            vals = _pc_all(sub, kinds, a[rows], seed + b + 1)
-            return [vals[c] for c in cols]
-
-        boot = np.array(Parallel(n_jobs=n_jobs)(
-            delayed(_one)(rows, b) for b, rows in enumerate(row_sets)))
-        sd = {c: float(boot[:, j].std(ddof=1)) for j, c in enumerate(cols)}
-
-    logger.info("Proxy capacity: top-3 %s",
-                sorted(point.items(), key=lambda kv: -kv[1])[:3])
-    return {"pc": point, "pc_sd": sd, "kinds": kinds, "boot": boot}
+    pc = _pc_all(arrays, kinds, a, seed)
+    logger.info("Proxy capacity: top-3 %s", sorted(pc.items(), key=lambda kv: -kv[1])[:3])
+    return {"pc": pc, "kinds": kinds}
 
 
 def pairwise_feature_mi(df: pd.DataFrame, cols: list[str], seed: int = SEED,

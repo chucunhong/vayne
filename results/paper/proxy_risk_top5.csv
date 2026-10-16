@@ -1,16 +1,16 @@
 Dataset,feature,PC,PC_sd,PC_highlight,PU,PU_sd,PU_highlight,PRS,PRS_sd,PRS_highlight,paper_line,role_in_paper
-german_credit,age,0.089,0.015,best,0.34,0.015,second,0.0303,0.0053,best,1037,High PC and PU
-german_credit,property,0.08,0.013,,0.375,0.015,best,0.03,0.005,second,1038,High PC and PU
-german_credit,housing,0.084,0.014,second,0.327,0.015,,0.0275,0.0047,,1039,High PC and PU
-german_credit,credit-amount,0.074,0.013,,0.332,0.015,,0.0246,0.0045,,1040,High PC and PU
-german_credit,checking-account,0.077,0.013,,0.313,0.015,,0.0241,0.0042,,1041,"High PC, PU below threshold"
-credit_card,PAY_AMT1,0.136,0.004,best,0.056,0.003,,0.0076,0.0005,best,1046,"High PC, PU at threshold"
-credit_card,PAY_AMT6,0.062,0.003,second,0.072,0.003,best,0.0045,0.0003,second,1047,High PC and PU
-credit_card,EDUCATION,0.026,0.002,,0.066,0.003,second,0.0017,0.0002,,1048,High PC and PU
-credit_card,PAY_5,0.033,0.003,,0.026,0.002,,0.0009,0.0001,,1049,"High PC, low PU"
-credit_card,MARRIAGE,0.017,0.002,,0.032,0.002,,0.0005,0.0001,,1050,"High PC, low PU"
-credit_approval,Employed,0.106,0.02,best,0.38,0.023,best,0.0403,0.008,best,1055,High PC and PU (dominant)
-credit_approval,EducationLevel,0.041,0.01,second,0.364,0.023,,0.0149,0.0038,second,1056,"High PC, low PU"
-credit_approval,Age,0.03,0.01,,0.36,0.023,,0.0108,0.0037,,1057,"High PC, low PU"
-credit_approval,YearsEmployed,0.026,0.009,,0.368,0.023,second,0.0096,0.0034,,1058,"High PC, PU at threshold"
-credit_approval,Debt,0.03,0.01,,0.285,0.021,,0.0086,0.0029,,1059,"High PC, low PU"
+german_credit,age,0.089,0.015,best,0.34,0.015,second,0.0303,0.0053,best,991,Complete path
+german_credit,property,0.08,0.013,,0.375,0.015,best,0.03,0.005,second,992,Complete path
+german_credit,housing,0.084,0.014,second,0.327,0.015,,0.0275,0.0047,,993,Complete path
+german_credit,credit-amount,0.074,0.013,,0.332,0.015,,0.0246,0.0045,,994,Complete path
+german_credit,checking-account,0.077,0.013,,0.313,0.015,,0.0241,0.0042,,995,Capacity only (PU just below tau2)
+credit_card,PAY_AMT1,0.136,0.004,best,0.056,0.003,,0.0076,0.0005,best,1000,"Capacity, PU at tau2"
+credit_card,PAY_AMT6,0.062,0.003,second,0.072,0.003,best,0.0045,0.0003,second,1001,Complete path
+credit_card,EDUCATION,0.026,0.002,,0.066,0.003,second,0.0017,0.0002,,1002,Complete path
+credit_card,PAY_5,0.033,0.003,,0.026,0.002,,0.0009,0.0001,,1003,Capacity only
+credit_card,MARRIAGE,0.017,0.002,,0.032,0.002,,0.0005,0.0001,,1004,Capacity only
+credit_approval,Employed,0.106,0.02,best,0.38,0.023,best,0.0403,0.008,best,1009,Complete path (dominant)
+credit_approval,EducationLevel,0.041,0.01,second,0.364,0.023,,0.0149,0.0038,second,1010,Capacity only
+credit_approval,Age,0.03,0.01,,0.36,0.023,,0.0108,0.0037,,1011,Capacity only
+credit_approval,YearsEmployed,0.026,0.009,,0.368,0.023,second,0.0096,0.0034,,1012,"Capacity, PU at tau2"
+credit_approval,Debt,0.03,0.01,,0.285,0.021,,0.0086,0.0029,,1013,Capacity only

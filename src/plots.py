@@ -156,14 +156,11 @@ def plot_proxy_use_bar(res: dict, path: Path) -> None:
     tau2 = res["thresholds"]["tau2"]
     feats = [r["feature"] for r in rows]
     pu = np.array([r["PU"] for r in rows])
-    sd = np.array([r["PU_sd"] if r.get("PU_sd") is not None else np.nan for r in rows])
-    sd = None if np.isnan(sd).all() else np.nan_to_num(sd)
     colors = [ROLE_COLOR[r["role"]] for r in rows]
 
     fig, ax = plt.subplots(figsize=(8, max(4.5, 0.36 * len(rows) + 1.5)))
     y = np.arange(len(rows))
-    ax.barh(y, pu, xerr=sd, color=colors, edgecolor="white", height=0.72,
-            error_kw={"ecolor": MUTED, "lw": 1, "capsize": 2})
+    ax.barh(y, pu, color=colors, edgecolor="white", height=0.72)
     ax.axvline(tau2, color="#E67E22", ls="--", lw=1.8)
     ax.set_yticks(y, feats)
     ax.invert_yaxis()

@@ -4,9 +4,9 @@ Save and print the output of src.pipeline.run_audit.
 Per dataset, in the results directory:
   {ds}.json                 — everything except raw scores
   {ds}_scores.npz           — every (n, R) score matrix, labels, and groups
-  {ds}_proxy_risk.csv       — feature × PC, PU, PRS (with SDs) × role
-  {ds}_mitigation.csv       — strategy × SP, EOD, PP, Acc, BA (with SDs)
-  {ds}_sensitivity.csv      — NF, DU_A, DU_A^abl (with SDs)
+  {ds}_proxy_risk.csv       — feature × PC, PU, PRS × role
+  {ds}_mitigation.csv       — strategy × SP, EOD, PP, Acc, BA (mean and SD over runs)
+  {ds}_sensitivity.csv      — DU_A, median PU τ₂, and their ratio
   {ds}_traditional.csv      — DT, NB, MLP, kNN on the same test records
 """
 
@@ -72,16 +72,13 @@ def print_results(result: dict) -> None:
     m = result["meta"]
     print(f"\n{'=' * 78}\n{m['dataset']}  |  {m['model']}  {m['encoding']}  k={m['k']}  "
           f"T={m['temperature']}  R={m['repeats']}{'  [MOCK]' if m['mock'] else ''}")
-    print(f"queries={m['n_queries']}  fallback={m['fallback_rate']:.2%}  "
-          f"utility={result['utility']['status']}")
+    print(f"queries={m['n_queries']}  fallback={m['fallback_rate']:.2%}")
     s = result["sensitivity"]
-    print("NF=%s  DU_A=%s  DU_A_abl=%s" % (_fmt(s["NF"], s["NF_sd"]),
-                                          _fmt(s["DU_A"], s["DU_A_sd"]),
-                                          _fmt(s["DU_A_abl"], s["DU_A_abl_sd"])))
+    print(f"DU_A={s['DU_A']:.4f}  τ2={s['tau2']:.4f}  DU_A/τ2={s['ratio']:.2f}")
     t = result["thresholds"]
     print(f"τ1={t['tau1']:.4f}  τ2={t['tau2']:.4f}  τ3={t['tau3']:.4f}")
-    print(tabulate([[r["feature"], _fmt(r["PC"], r["PC_sd"], 3), _fmt(r["PU"], r["PU_sd"], 3),
-                     _fmt(r["PRS"], r["PRS_sd"]), r["role"]] for r in result["proxy_table"][:10]],
+    print(tabulate([[r["feature"], _fmt(r["PC"], nd=3), _fmt(r["PU"], nd=3),
+                     _fmt(r["PRS"]), r["role"]] for r in result["proxy_table"][:10]],
                    headers=["feature", "PC", "PU", "PRS", "role"], tablefmt="simple"))
     plan = result["mitigation_plan"]
     print(f"F_mask={plan['F_mask']} (θ={plan['theta_prs']:.4f})  F_filt={plan['F_filt']}")

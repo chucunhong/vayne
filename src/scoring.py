@@ -1,7 +1,7 @@
 """
 Repeated scoring: each prompt is queried R times and the analysis uses the
-average s̄ (Eq. 3). Scores are kept as (n, R) matrices so that the bootstrap
-can resample repeats within applicants.
+average s̄ (Eq. 3). Scores are kept as (n, R) matrices: column r is scoring
+run r, from which the per-run decisions and metrics are computed.
 """
 
 import logging
@@ -66,8 +66,8 @@ class Scorer:
 
 def fill_baseline(mat: np.ndarray) -> np.ndarray:
     """
-    Unmodified profiles: failed repeats are dropped from the average; an
-    applicant whose every repeat failed gets 0.5.
+    Unmodified profiles: a failed repeat takes the mean of the applicant's
+    other repeats; an applicant whose every repeat failed gets 0.5.
     """
     out = mat.copy()
     all_nan = np.isnan(out).all(axis=1)
@@ -75,13 +75,16 @@ def fill_baseline(mat: np.ndarray) -> np.ndarray:
         logger.warning("%d applicants had no parseable baseline reply; using 0.5",
                        int(all_nan.sum()))
         out[all_nan] = 0.5
+    rows, cols = np.where(np.isnan(out))
+    out[rows, cols] = np.nanmean(out, axis=1)[rows]
     return out
 
 
 def fill_modified(mat: np.ndarray, base_mean: np.ndarray) -> np.ndarray:
     """
-    Ablated / swapped profiles: a failed query falls back to the applicant's
-    baseline score s̄(z), which biases DU and PU toward zero (Sect. 4.1).
+    Ablated or mitigated profiles: a failed query falls back to the
+    applicant's baseline score s̄(z), which biases DU and PU toward zero
+    (Sect. 4.1).
     """
     out = mat.copy()
     rows, cols = np.where(np.isnan(out))

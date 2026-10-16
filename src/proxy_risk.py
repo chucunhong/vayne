@@ -20,24 +20,15 @@ import numpy as np
 EPS = 1e-9
 
 ROLE_TEXT = {
-    "high_risk":     "High PC and PU",
-    "capacity_only": "High PC, low PU",
-    "use_only":      "Low PC, high PU",
-    "low":           "Low PC and PU",
+    "high_risk":     "Complete path",
+    "capacity_only": "Capacity only",
+    "use_only":      "Use only",
+    "low":           "Neither",
 }
 
 
 def proxy_risk(pc: dict[str, float], pu: dict[str, float]) -> dict[str, float]:
     return {f: pc[f] * pu[f] for f in pu if f in pc}
-
-
-def proxy_risk_sd(pc_boot: np.ndarray, pu_boot: np.ndarray, feats: list[str]) -> dict[str, float]:
-    """SD of PC_b × PU_b over paired bootstrap replicates (columns aligned with feats)."""
-    n = min(len(pc_boot), len(pu_boot))
-    if n < 2:
-        return {f: np.nan for f in feats}
-    prod = pc_boot[:n] * pu_boot[:n]
-    return {f: float(prod[:, j].std(ddof=1)) for j, f in enumerate(feats)}
 
 
 def thresholds(pc: dict[str, float], pu: dict[str, float],
@@ -61,7 +52,11 @@ def role(pc: float, pu: float, tau1: float, tau2: float) -> str:
 
 
 def mask_set(prs: dict[str, float], theta: float | None) -> tuple[list[str], float]:
-    """F_mask = {j : PRS_j > θ_PRS}, ordered by PRS. θ defaults to the 75th percentile."""
+    """
+    F_mask = {j : PRS_j > θ_PRS}, ordered by PRS. The paper sets θ_PRS per
+    dataset from the RQ2 diagnosis (src/config.py); without one, θ falls back
+    to the 75th percentile of PRS.
+    """
     if theta is None:
         theta = float(np.percentile(list(prs.values()), 75))
     feats = sorted((f for f, v in prs.items() if v > theta), key=lambda f: -prs[f])

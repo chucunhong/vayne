@@ -4,9 +4,12 @@ Multilayer Perceptron, k-Nearest Neighbors with scikit-learn defaults,
 trained on the training split and evaluated on the same test records as the
 LLM configurations. Categorical features are one-hot encoded and numerical
 features standardized on the training split; the protected attribute is not
-an input, matching the deployment profile.
+an input, matching the deployment profile. Each model is trained R times
+with seeds SEED + r and reported as mean and SD over the runs, like the LLM
+scorers; Naive Bayes and kNN are deterministic and have an SD of zero.
 """
 
+import numpy as np
 import pandas as pd
 from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
@@ -18,16 +21,16 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.tree import DecisionTreeClassifier
 
-from src.config import N_BOOTSTRAP, SEED
+from src.config import N_REPEATS, SEED
 from src.data_loader import DatasetSplits
-from src.fairness_metrics import metrics_with_sd
+from src.fairness_metrics import metrics_over_runs
 from src.proxy_capacity import feature_kind
 
 MODELS = {
-    "DT":  lambda: DecisionTreeClassifier(random_state=SEED),
-    "NB":  lambda: GaussianNB(),
-    "MLP": lambda: MLPClassifier(random_state=SEED),
-    "kNN": lambda: KNeighborsClassifier(),
+    "DT":  lambda seed: DecisionTreeClassifier(random_state=seed),
+    "NB":  lambda seed: GaussianNB(),
+    "MLP": lambda seed: MLPClassifier(random_state=seed),
+    "kNN": lambda seed: KNeighborsClassifier(),
 }
 
 
@@ -51,15 +54,17 @@ def _design(splits: DatasetSplits):
     return pre, frame
 
 
-def evaluate_traditional(splits: DatasetSplits, n_boot: int = N_BOOTSTRAP) -> list[dict]:
-    """One row per baseline: point metrics on the test split with bootstrap SDs."""
+def evaluate_traditional(splits: DatasetSplits, repeats: int = N_REPEATS) -> list[dict]:
+    """One row per baseline: metrics on the test split, mean and SD over `repeats` runs."""
     pre, frame = _design(splits)
     X_tr, X_te = frame(splits.train.df), frame(splits.test.df)
     rows = []
     for name, make in MODELS.items():
-        clf = make_pipeline(clone(pre), make())
-        clf.fit(X_tr, splits.train.y)
-        pred = clf.predict(X_te).astype(float)
-        m = metrics_with_sd(pred[:, None], splits.test.y, splits.test.a, n_boot)
-        rows.append({"Model": name, **m})
+        preds = []
+        for r in range(repeats):
+            clf = make_pipeline(clone(pre), make(SEED + r))
+            clf.fit(X_tr, splits.train.y)
+            preds.append(clf.predict(X_te).astype(float))
+        rows.append({"Model": name, **metrics_over_runs(np.column_stack(preds),
+                                                         splits.test.y, splits.test.a)})
     return rows

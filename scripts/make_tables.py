@@ -5,9 +5,10 @@ every number in paper.tex can be pasted from a file the code produced.
 Outputs in results/tables/:
   tab_full_{ds}.tex     — benchmark rows (Tables fullca / fullcc / fullgc)
   tab_tempsweep.tex     — temperature sweep (Table tempsweep)
+  tab_sensitivity.tex   — DU_A against the median PU (Table sensitivity)
   tab_proxyrisk.tex     — top-5 proxies (Table proxyrisk)
-  tab_mitigation.tex    — mitigation (Table mitigation; absolute values)
-  numbers.tex           — \\newcommand macros for in-text values (NF, DU_A, τ, ...)
+  tab_mitigation.tex    — mitigation (Table mitigation)
+  numbers.tex           — \\newcommand macros for in-text values (DU_A, τ, θ_PRS, ...)
 
 Highlighting follows the paper: \\best / \\second per column (max for BA and
 Acc, closest to zero for SP, EOD, PP), \\underline for the best within an LLM.
@@ -150,14 +151,14 @@ def _esc(s: str) -> str:
 
 def vayne_tables(results: dict, out: Path):
     from src.proxy_risk import ROLE_TEXT
-    proxy, mitig, macros = [], [], []
+    proxy, mitig, sens, macros = [], [], [], []
     for ds, res in results.items():
         title = DATASET_CONFIGS[ds]["title"].replace(" ", "\\\\")
         top = res["proxy_table"][:5]
         proxy.append(f"\\multirow{{5}}{{*}}{{\\makecell[l]{{{title}}}}}")
         for r in top:
-            proxy.append(f"  & {_esc(r['feature'])} & {_cell(r['PC'], r['PC_sd'], 3)} & "
-                         f"{_cell(r['PU'], r['PU_sd'], 3)} & {_cell(r['PRS'], r['PRS_sd'])} & "
+            proxy.append(f"  & {_esc(r['feature'])} & {_cell(r['PC'], None, 3)} & "
+                         f"{_cell(r['PU'], None, 3)} & {_cell(r['PRS'], None)} & "
                          f"{ROLE_TEXT[r['role']]} \\\\")
         proxy.append("\\midrule")
 
@@ -172,8 +173,9 @@ def vayne_tables(results: dict, out: Path):
 
         tag = "".join(w[0] for w in ds.split("_")).upper()   # CA, CC, GC
         s, t, plan, meta = res["sensitivity"], res["thresholds"], res["mitigation_plan"], res["meta"]
-        for k in ("NF", "DU_A", "DU_A_abl"):
-            macros.append(f"\\newcommand{{\\{k.replace('_', '')}{tag}}}{{{s[k]:.3f}}}")
+        sens.append(f"{DATASET_CONFIGS[ds]['title']} & {s['DU_A']:.3f} & {s['tau2']:.3f} & "
+                    f"{s['ratio']:.2f} \\\\")
+        macros.append(f"\\newcommand{{\\DUA{tag}}}{{{s['DU_A']:.3f}}}")
         macros += [f"\\newcommand{{\\tauone{tag}}}{{{t['tau1']:.3f}}}",
                    f"\\newcommand{{\\tautwo{tag}}}{{{t['tau2']:.3f}}}",
                    f"\\newcommand{{\\tauthree{tag}}}{{{t['tau3']:.3f}}}",
@@ -181,14 +183,14 @@ def vayne_tables(results: dict, out: Path):
                    f"\\newcommand{{\\Fmask{tag}}}{{{_esc(', '.join(plan['F_mask']))}}}",
                    f"\\newcommand{{\\Ffilt{tag}}}{{{_esc(', '.join(plan['F_filt']))}}}",
                    f"\\newcommand{{\\fallback{tag}}}{{{100 * meta['fallback_rate']:.2f}\\%}}",
-                   f"\\newcommand{{\\utility{tag}}}{{{res['utility']['status']}}}",
                    f"% {ds}: {meta['model']} {meta['encoding']} k={meta['k']} "
-                   f"T={meta['temperature']} R={meta['repeats']} B={meta['n_boot']} "
+                   f"T={meta['temperature']} R={meta['repeats']} "
                    f"queries={meta['n_queries']} mock={meta['mock']}"]
+    (out / "tab_sensitivity.tex").write_text("\n".join(sens) + "\n")
     (out / "tab_proxyrisk.tex").write_text("\n".join(proxy[:-1]) + "\n")
     (out / "tab_mitigation.tex").write_text("\n".join(mitig[:-1]) + "\n")
     (out / "numbers.tex").write_text("\n".join(macros) + "\n")
-    logger.info("tab_proxyrisk.tex, tab_mitigation.tex, numbers.tex")
+    logger.info("tab_sensitivity.tex, tab_proxyrisk.tex, tab_mitigation.tex, numbers.tex")
 
 
 def main():

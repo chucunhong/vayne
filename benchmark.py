@@ -3,8 +3,8 @@ Few-shot credit-classification benchmark (RQ1) and traditional baselines.
 
 Every configuration (model × k × encoding × temperature) is scored on the
 test split (and optionally the development split, used for selecting the
-audit configuration) with the same demonstration set for every record, a
-single query per prompt by default, and bootstrap SDs over applicants.
+audit configuration) with the same demonstration set for every record, in
+R scoring runs; metrics are the mean and SD over the runs.
 
 Results are merged into results/benchmark/{model}_{dataset}.csv, keyed by
 (Split, Encoding, K, Temp), so sweeps can be run in several invocations.
@@ -29,10 +29,10 @@ import pandas as pd
 
 from src.config import (
     BENCHMARK_DIR, BENCHMARK_K_VALUES, BENCHMARK_MODELS, BENCHMARK_TEMPERATURE,
-    DATASET_ORDER, DATASET_CONFIGS, ENCODINGS, MAX_OUTPUT_TOKENS, N_BOOTSTRAP,
+    DATASET_ORDER, DATASET_CONFIGS, ENCODINGS, MAX_OUTPUT_TOKENS, N_REPEATS,
 )
 from src.data_loader import make_splits, sample_demos
-from src.fairness_metrics import metrics_with_sd
+from src.fairness_metrics import metrics_over_runs
 from src.llm_client import MOCK
 from src.scoring import Scorer, fill_baseline
 from src.serializer import serialize
@@ -53,9 +53,8 @@ def parse_args():
     p.add_argument("--encodings", nargs="+", default=ENCODINGS, choices=ENCODINGS)
     p.add_argument("--temps", nargs="+", type=float, default=[BENCHMARK_TEMPERATURE])
     p.add_argument("--splits", nargs="+", default=["test"], choices=["dev", "test"])
-    p.add_argument("--repeats", type=int, default=1)
+    p.add_argument("--repeats", type=int, default=N_REPEATS)
     p.add_argument("--max-tokens", type=int, default=MAX_OUTPUT_TOKENS)
-    p.add_argument("--n-boot", type=int, default=N_BOOTSTRAP)
     p.add_argument("--traditional", action="store_true",
                    help="Only evaluate DT/NB/MLP/kNN (no API calls)")
     p.add_argument("--out", default=str(BENCHMARK_DIR))
@@ -65,11 +64,7 @@ def parse_args():
 def _merge_save(rows: list[dict], path) -> None:
     new = pd.DataFrame(rows)
     if path.exists():
-        old = pd.read_csv(path)
-        if not set(KEY) <= set(old.columns):
-            sys.exit(f"{path} is in the pre-split legacy format; move it aside before "
-                     "writing new benchmark results to this directory")
-        merged = pd.concat([old, new]).drop_duplicates(subset=KEY, keep="last")
+        merged = pd.concat([pd.read_csv(path), new]).drop_duplicates(subset=KEY, keep="last")
     else:
         merged = new
     merged.sort_values(KEY).to_csv(path, index=False, float_format="%.6f")
@@ -88,7 +83,7 @@ def main():
         config = DATASET_CONFIGS[ds]
         splits = make_splits(config)
 
-        trad = pd.DataFrame(evaluate_traditional(splits, args.n_boot))
+        trad = pd.DataFrame(evaluate_traditional(splits, args.repeats))
         trad.insert(0, "Dataset", ds)
         trad.to_csv(out / f"traditional_{ds}.csv", index=False, float_format="%.6f")
         logger.info("%s traditional baselines:\n%s", ds,
@@ -112,7 +107,7 @@ def main():
                             mat = scorer.score(prompts, args.repeats,
                                                desc=f"{slug} {ds} {split_name} {enc} k={k} T={temp}")
                             fails = scorer.n_failed - n_fail0
-                            m = metrics_with_sd(fill_baseline(mat), split.y, split.a, args.n_boot)
+                            m = metrics_over_runs(fill_baseline(mat), split.y, split.a)
                             rows.append({"Dataset": ds, "Model": slug, "Split": split_name,
                                          "Encoding": enc, "K": k, "Temp": temp,
                                          "N": len(split), "Repeats": args.repeats,

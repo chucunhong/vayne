@@ -30,8 +30,7 @@ logger = logging.getLogger("make_figures")
 
 
 def load_benchmark(bench_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
-    llm = [pd.read_csv(p) for p in bench_dir.glob("*.csv")
-           if not p.name.startswith("traditional_") and "Split" in pd.read_csv(p, nrows=0).columns]
+    llm = [pd.read_csv(p) for p in bench_dir.glob("*.csv") if not p.name.startswith("traditional_")]
     trad = [pd.read_csv(p) for p in bench_dir.glob("traditional_*.csv")]
     return (pd.concat(llm) if llm else pd.DataFrame(),
             pd.concat(trad) if trad else pd.DataFrame())
@@ -49,7 +48,7 @@ def main():
 
     bench, trad = load_benchmark(Path(args.bench_dir))
     if bench.empty:
-        logger.warning("No benchmark CSVs in the new format — skipping RQ1 figures")
+        logger.warning("No benchmark CSVs — skipping RQ1 figures")
     else:
         test = bench[bench["Split"] == "test"]
         ksweep = test[test["Temp"].round(3) == round(BENCHMARK_TEMPERATURE, 3)]
@@ -67,7 +66,7 @@ def main():
     for ds in DATASET_ORDER:
         path = Path(args.vayne_dir) / f"{ds}.json"
         if not path.exists() or "proxy_table" not in (res := json.loads(path.read_text())):
-            logger.warning("No VAYNE result in the new format for %s — skipping", ds)
+            logger.warning("No VAYNE result for %s — skipping", ds)
             continue
         plots.plot_proxy_use_bar(res, out / f"fig_{ds}_proxy_bar_plot.png")
         plots.plot_pc_pu_scatter(res, out / f"fig_{ds}_pc_pu_scatter.png")

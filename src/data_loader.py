@@ -51,13 +51,20 @@ def load_dataset(config: dict) -> pd.DataFrame:
     str_cols = df.select_dtypes(include="object").columns
     df[str_cols] = df[str_cols].apply(lambda s: s.str.strip())
 
-    # A record without a recorded protected attribute cannot be assigned to a group.
+    # Records without a recorded protected attribute are assigned its most
+    # frequent value (config "impute_protected": "mode"); otherwise dropped.
     sa = config["sensitive_col"]
     known = df[sa].astype(str).isin([str(v) for v in config["protected_display"]])
     if (~known).any():
-        logger.info("%s: dropping %d records with missing %s",
-                    config["name"], int((~known).sum()), sa)
-        df = df[known]
+        if config.get("impute_protected") == "mode":
+            mode = df.loc[known, sa].mode().iloc[0]
+            logger.info("%s: %d records with missing %s assigned the mode '%s'",
+                        config["name"], int((~known).sum()), sa, mode)
+            df.loc[~known, sa] = mode
+        else:
+            logger.info("%s: dropping %d records with missing %s",
+                        config["name"], int((~known).sum()), sa)
+            df = df[known]
     return df.reset_index(drop=True)
 
 

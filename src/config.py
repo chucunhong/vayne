@@ -1,7 +1,6 @@
 """
 VAYNE configuration — every constant here corresponds to a choice stated in
-the paper's experimental protocol (Sect. 4.1). Values the paper marks as
-provisional are noted inline so they can be changed in one place.
+the paper's experimental protocol (Sect. 4.1).
 """
 
 from pathlib import Path
@@ -36,13 +35,12 @@ MAX_OUTPUT_TOKENS = 128
 
 # Benchmark sweep
 BENCHMARK_K_VALUES     = [0, 2, 8, 32, 128, 256, 512]
-BENCHMARK_TEMPERATURE  = 0.0                      # paper: provisional
+BENCHMARK_TEMPERATURE  = 0.0
 TEMPERATURE_SWEEP      = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
 ENCODINGS              = ["template", "markdown"]
 
 # ── Repeated scoring and statistics ─────────────────────────────────────────
-N_REPEATS          = 5       # R  (paper: provisional)
-N_BOOTSTRAP        = 2000    # B  (paper: provisional)
+N_REPEATS          = 5       # R
 DECISION_THRESHOLD = 0.5     # t
 PARSE_RETRIES      = 3       # retries when the reply is not valid JSON
 MAX_WORKERS        = 32      # parallel LLM requests
@@ -52,8 +50,7 @@ KNN_NEIGHBORS          = 3   # K in the Ross (2014) estimator
 MAX_CATEGORICAL_LEVELS = 20  # integer features with ≤ this many values are categorical
 
 # ── Mitigation ──────────────────────────────────────────────────────────────
-FILTER_BA_TOLERANCE = 0.01   # δ   (paper: provisional)
-UTILITY_TOLERANCE   = 0.05   # δ_U (paper: provisional)
+FILTER_BA_TOLERANCE = 0.01   # δ
 FAIR_ICL_PER_CELL   = 32     # demonstrations per sex × label cell (k = 128)
 MAX_FILTER_CANDIDATES = 6    # exhaustive subset search when |F_mask| ≤ this
 
@@ -74,10 +71,12 @@ SYSTEM_PROMPT = (
 # ── Datasets ────────────────────────────────────────────────────────────────
 # protected_value  : value of the protected group (a = 0)
 # protected_display: how values are written when the A field is inserted for
-#                    the controlled audit (paired swap / ablation variant)
-# theta_prs        : PRS threshold θ_PRS for F_mask; None → 75th percentile of
-#                    PRS (the paper does not state a selection rule)
+#                    the controlled direct-sensitivity audit (DU_A)
+# theta_prs        : PRS threshold θ_PRS for F_mask, set from the RQ2 diagnosis
+#                    (Sect. 4.4); None → 75th percentile of PRS
 # audit_n          : (dev, test) records audited; None → the full split
+# impute_protected : "mode" → records with a missing A get its most frequent
+#                    value; otherwise such records are dropped
 DATASET_CONFIGS = {
     "credit_approval": {
         "name":              "credit_approval",
@@ -93,7 +92,8 @@ DATASET_CONFIGS = {
                              "Return 1.0 if the application should be approved, 0.0 if not.",
         "currency_note":     None,
         "exclude_cols":      ["ZipCode"],
-        "theta_prs":         None,
+        "impute_protected":  "mode",     # 12 records have no recorded sex
+        "theta_prs":         0.020,
         "audit_n":           None,
     },
     "credit_card": {
@@ -110,7 +110,7 @@ DATASET_CONFIGS = {
                              "Return 1.0 if the client will default, 0.0 if not.",
         "currency_note":     "Amounts are in New Taiwan Dollar (NT$).",
         "exclude_cols":      [],
-        "theta_prs":         None,
+        "theta_prs":         0.004,
         "audit_n":           (1000, 1000),
     },
     "german_credit": {
@@ -127,7 +127,7 @@ DATASET_CONFIGS = {
                              "Return 1.0 if the applicant is creditworthy, 0.0 if not.",
         "currency_note":     "Amounts are in Deutsche Mark (DM).",
         "exclude_cols":      [],
-        "theta_prs":         None,
+        "theta_prs":         0.024,
         "audit_n":           None,
     },
 }

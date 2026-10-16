@@ -6,7 +6,7 @@ temperature 0.4, R repeated queries per prompt.
 Usage:
   python main.py                                  # all three datasets
   python main.py --datasets german_credit --repeats 5
-  VAYNE_MOCK=1 python main.py --results-dir /tmp/vayne_smoke --n-boot 50   # offline smoke test
+  VAYNE_MOCK=1 python main.py --results-dir /tmp/vayne_smoke   # offline smoke test
 
 Figures and LaTeX tables are produced afterwards from the saved files:
   python -m scripts.make_figures && python -m scripts.make_tables
@@ -19,7 +19,7 @@ from pathlib import Path
 
 from src.config import (
     AUDIT_ENCODING, AUDIT_K, AUDIT_MODEL, AUDIT_TEMPERATURE, DATASET_CONFIGS,
-    DATASET_ORDER, MAX_OUTPUT_TOKENS, N_BOOTSTRAP, N_REPEATS, RESULTS_DIR,
+    DATASET_ORDER, MAX_OUTPUT_TOKENS, N_REPEATS, RESULTS_DIR,
 )
 from src.llm_client import MOCK
 from src.pipeline import run_audit
@@ -38,10 +38,9 @@ def parse_args():
     p.add_argument("--k", type=int, default=AUDIT_K)
     p.add_argument("--temperature", type=float, default=AUDIT_TEMPERATURE)
     p.add_argument("--repeats", type=int, default=N_REPEATS)
-    p.add_argument("--n-boot", type=int, default=N_BOOTSTRAP)
     p.add_argument("--max-tokens", type=int, default=MAX_OUTPUT_TOKENS)
     p.add_argument("--theta-prs", type=float, default=None,
-                   help="θ_PRS for every dataset (default: per-dataset config, else 75th pct of PRS)")
+                   help="θ_PRS for every dataset (default: the per-dataset value in src/config.py)")
     p.add_argument("--results-dir", default=str(RESULTS_DIR))
     return p.parse_args()
 
@@ -57,7 +56,7 @@ def main():
         logger.info("Audit: %s  (%s, %s, k=%d, T=%.2f, R=%d)", ds, args.model, args.encoding,
                     args.k, args.temperature, args.repeats)
         result = run_audit(ds, args.model, args.encoding, args.k, args.temperature,
-                           args.repeats, args.n_boot, args.theta_prs, args.max_tokens)
+                           args.repeats, args.theta_prs, args.max_tokens)
         save_results(result, results_dir)
         print_results(result)
 
