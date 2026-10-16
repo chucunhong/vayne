@@ -457,18 +457,6 @@ We welcome contributions! Please:
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
 
----
-
-## 📚 Citation
-
-```bibtex
-@article{vayne2026,
-  title   = {Explaining and Mitigating Proxy Fairness in LLM-based Credit Risk Decisions},
-  author  = {Giang Thi Thu, Huyen and Doan Viet, Thang and Nguyen Long, Giang and Ban, Ha-Bang},
-  year    = {2026}
-}
-```
-
 ## 🙏 Acknowledgments
 
 - LLM access via [OpenRouter](https://openrouter.ai/)
